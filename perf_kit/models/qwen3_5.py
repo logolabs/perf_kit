@@ -224,6 +224,9 @@ class FastQwen35:
             if ckpt is not None and ckpt[i] and torch.is_grad_enabled():
                 h, delta = checkpoint(self._layer, i, h, delta, packed, cos, sin, use_reentrant=False,
                                       preserve_rng_state=False)
+            elif getattr(self, "offload", None) is not None:          # activations to host memory (perf_kit/offload.py)
+                with self.offload.layer(i, int(packed.ids.numel())):
+                    h, delta = self._layer(i, h, delta, packed, cos, sin)
             else:
                 h, delta = self._layer(i, h, delta, packed, cos, sin)
         return ops.add_rmsnorm(delta, h, self.norm, self.cfg.eps, "offset", self.impl)[0]

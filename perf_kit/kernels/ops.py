@@ -8,16 +8,25 @@ references, in float64, against the transformers model itself).
   conv_silu       fla's Triton causal_conv1d with cu_seqlens (rows never see each other)             | per-row conv
   gdn             fla chunk_gated_delta_rule, native GVA (no q/k repeat), varlen                      | per-row HF torch
   attention       flash-attn 2 varlen, causal, GQA                                                    | per-row SDPA
+Backend switches (experiment copies; logged through available()): PK_GDN_BACKEND = fla (default) | flashqla (Qwen's
+TileLang GDN kernels; q/k L2-normalised and g/beta computed in torch first), PK_ATTN_BACKEND = fa2 (default) | fa3
+(flash-attn 3 varlen, Hopper).
   gated_rmsnorm   fla's fused gated RMSNorm (swish gate)                                              | HF math
 
 `impl` is "fast" or "ref"; "auto" = fast on CUDA when the library imports, else ref.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 _LIBS: dict = {}
+GDN_BACKEND = os.environ.get("PK_GDN_BACKEND", "fla")
+ATTN_BACKEND = os.environ.get("PK_ATTN_BACKEND", "fa2")
+if GDN_BACKEND not in ("fla", "flashqla") or ATTN_BACKEND not in ("fa2", "fa3"):
+    raise ValueError(f"PK_GDN_BACKEND={GDN_BACKEND!r} / PK_ATTN_BACKEND={ATTN_BACKEND!r}")
 
 
 def _lib(name):
@@ -35,6 +44,10 @@ def _lib(name):
                 from fla.modules.fused_norm_gate import rms_norm_gated as m
             elif name == "flash":
                 from flash_attn import flash_attn_varlen_func as m
+            elif name == "fa3":
+                from flash_attn_interface import flash_attn_varlen_func as m
+            elif name == "flashqla":
+                from flash_qla import chunk_gated_delta_rule as m
             elif name == "triton":
                 import triton as m
             else:
@@ -55,8 +68,9 @@ def use_fast(impl: str, x: torch.Tensor, lib: str) -> bool:
 
 
 def available() -> dict:
-    return {k: _lib(k) is not None for k in ("liger_rms", "liger_add_rms", "fla_conv", "fla_gdn", "fla_gnorm", "flash",
-                                             "triton")}
+    out = {k: _lib(k) is not None for k in ("liger_rms", "liger_add_rms", "fla_conv", "fla_gdn", "fla_gnorm", "flash",
+                                            "triton", "fa3", "flashqla")}
+    return {**out, "gdn_backend": GDN_BACKEND, "attn_backend": ATTN_BACKEND}
 
 
 # ------------------------------------------------------------------ RMSNorm, (1 + w) offset, fp32 compute
@@ -211,7 +225,18 @@ def gdn_ref(q, k, v, g, beta, packed):
     return torch.cat(outs, 0)
 
 
+def l2norm(x, eps=1e-6):
+    """fla's l2norm (use_qk_l2norm_in_kernel): x / sqrt(sum x^2 + eps), fp32 compute."""
+    xf = x.float()
+    return (xf * torch.rsqrt(xf.square().sum(-1, keepdim=True) + eps)).to(x.dtype)
+
+
 def gdn(q, k, v, g, beta, packed, impl="auto"):
+    if GDN_BACKEND == "flashqla" and use_fast(impl, q, "flashqla"):
+        o, _ = _lib("flashqla")(l2norm(q)[None], l2norm(k)[None], v[None], g[None].float(), beta[None],
+                                scale=q.shape[-1] ** -0.5, initial_state=None, output_final_state=False,
+                                cu_seqlens=packed.cu64)
+        return o[0]
     if use_fast(impl, q, "fla_gdn"):
         o, _ = _lib("fla_gdn")(q[None], k[None], v[None], g=g[None], beta=beta[None], use_qk_l2norm_in_kernel=True,
                                cu_seqlens=packed.cu64, cu_seqlens_cpu=packed.cu_cpu)
@@ -223,7 +248,7 @@ def gdn_gated(q, k, v, a, b, A_log, dt_bias, packed, impl="auto", fused_gate=Tru
     """Qwen3.5 / Qwen3-Next Gated DeltaNet from the RAW projections: g = -exp(A_log) * softplus(a + dt_bias),
     beta = sigmoid(b). Fast path: fla computes both inside its kernels (use_gate_in_kernel /
     use_beta_sigmoid_in_kernel; ~10 fewer launches per layer per direction)."""
-    if fused_gate and use_fast(impl, q, "fla_gdn"):
+    if fused_gate and GDN_BACKEND == "fla" and use_fast(impl, q, "fla_gdn"):
         o, _ = _lib("fla_gdn")(q[None], k[None], v[None], g=a[None], beta=b[None], use_qk_l2norm_in_kernel=True,
                                use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
                                use_beta_sigmoid_in_kernel=True, cu_seqlens=packed.cu64, cu_seqlens_cpu=packed.cu_cpu)
@@ -252,6 +277,9 @@ def attention_ref(q, k, v, packed, scale):
 
 
 def attention(q, k, v, packed, scale, impl="auto"):
+    if ATTN_BACKEND == "fa3" and use_fast(impl, q, "fa3"):
+        o = _lib("fa3")(q, k, v, packed.cu, packed.cu, packed.max_len, packed.max_len, softmax_scale=scale, causal=True)
+        return o[0] if isinstance(o, tuple) else o
     if use_fast(impl, q, "flash"):
         return _lib("flash")(q, k, v, packed.cu, packed.cu, packed.max_len, packed.max_len, causal=True,
                              softmax_scale=scale)

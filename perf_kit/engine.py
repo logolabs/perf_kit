@@ -107,13 +107,15 @@ class Engine:
     def __init__(self, model, *, lr: float, betas=(0.9, 0.99), eps: float = 1e-8, weight_decay: float = 0.0,
                  clip: float = 1.0, head_chunk: int = 1024, ckpt: CkptPolicy | None = None, world: int = 1,
                  dist=None, segs=(1, 2), fused: bool | None = None, answer_weight: float = 1.0,
-                 answer_seg: int | None = None):
+                 answer_seg: int | None = None, act_offload=None):
         """answer_weight != 1: targets of segment answer_seg (default: the last of segs) weigh answer_weight in the
         loss, the others 1; the step's normaliser (layout.label_total) must then be the WEIGHTED target count."""
         self.m, self.world, self.dist, self.clip, self.chunk = model, world, dist, clip, head_chunk
         self.answer_weight = float(answer_weight)
         self.answer_seg = segs[-1] if answer_seg is None else answer_seg
         self.ckpt = ckpt
+        self.offload = act_offload                                      # perf_kit.offload.ActOffload or None
+        model.offload = act_offload
         self.param = torch.nn.Parameter(model.lora.master)              # shares storage with the master buffer
         self.param.grad = model.lora.grad
         dev = model.lora.master.device
@@ -162,6 +164,8 @@ class Engine:
                 ((ce * w).sum() * inv).backward()
             else:
                 (ce.sum() * inv).backward()
+            if self.offload is not None:
+                self.offload.end_step()                                 # recycle this micro-batch's host buffers
             self._accumulate(ce.detach(), packed)
         if self.world > 1:
             self.dist.all_reduce(m.lora.grad)                           # SUM: the loss is already globally normalised
