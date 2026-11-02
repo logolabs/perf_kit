@@ -246,13 +246,13 @@ a.cite{color:var(--accink)}
 <h2 class="sec" id="s3"><span class="n">3</span><span>Correctness: the same math</span></h2>
 <figure>
   <img src="img/loss_parity.png" alt="Per-step training loss of perf_kit and four baselines on identical batches, with the differences to perf_kit below">
-  <figcaption><b>Figure 2.</b> Per-step training loss on identical batches, one GH200. Top: perf_kit, with ms-swift's 10-step means (it also trains one extra newline token per row). Bottom: the difference of each padded baseline to perf_kit, below 6e-4 at every step on a loss of about 0.95.</figcaption>
+  <figcaption><b>Figure 2.</b> Per-step training loss on identical batches, one GH200. Top: perf_kit, with ms-swift's 10-step means (it also trains one extra newline token per row). Bottom: the difference of each padded baseline to perf_kit on a loss of about 0.95: at most 4.5e-4 and 5.1e-4 for the two transformers + PEFT runs, and at most 6.3e-4 (step 43) for Unsloth.</figcaption>
 </figure>
 <p>Speed bought with different math would be worthless, so equivalence is tested at three levels.</p>
 <ul>
   <li><b>Kernels, in float64 on CPU.</b> perf_kit's model is tested against transformers + PEFT for cross-entropy and every LoRA gradient (tolerances 1e-6 / 1e-5), including packed batches: a packed micro-batch equals its rows run one by one.</li>
   <li><b>Harnesses, in float32 on CPU.</b> <code>tests/test_bench_parity.py</code> runs the perf_kit and transformers + PEFT benchmark harnesses on a tiny Qwen3.5 checkpoint and requires equal per-step losses to 2e-5 relative.</li>
-  <li><b>End to end, in bf16 on GH200.</b> Per-step losses of perf_kit and transformers + PEFT (with and without FA2 + Liger) and Unsloth differ by less than 6e-4 at every step (Figure 2). All start from the same value (step-1 loss 0.9651–0.9656) and end at the same validation loss: 0.96749–0.96778 across all five frameworks, against 1.0454–1.0456 for the base model.</li>
+  <li><b>End to end, in bf16 on GH200.</b> Per-step losses of perf_kit and transformers + PEFT (with and without FA2 + Liger) differ by less than 6e-4 at every step, and those of perf_kit and Unsloth by at most 6.3e-4 (Figure 2). All start from the same value (step-1 loss 0.9651–0.9656) and end at the same validation loss: 0.96749–0.96778 across all five frameworks, against 1.0454–1.0456 for the base model.</li>
 </ul>
 <p><b>Two bugs found while preparing the release.</b> Both are fixed and covered by tests.</p>
 <ol>

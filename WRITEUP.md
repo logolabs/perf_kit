@@ -231,8 +231,8 @@ micro-batches pad more (up to 54% padding) and the fixed per-step costs are amor
 
 ![loss_parity](figures/loss_parity.png)
 
-**Same math.** Per-step training losses of perf_kit and transformers + PEFT (with and without FA2 + Liger, and
-Unsloth) differ by less than 6e-4 at every step (bf16 noise), start from the same value (step-1 loss
+**Same math.** Per-step training losses of perf_kit and transformers + PEFT (with and without FA2 + Liger)
+differ by less than 6e-4 at every step, and those of perf_kit and Unsloth by at most 6.3e-4 (bf16 noise), start from the same value (step-1 loss
 0.9651-0.9656) and end at the same validation loss (0.96749-0.96778 across all five frameworks; base model
 1.0454-1.0456). A CPU test runs the same two harnesses on a tiny Qwen3.5 checkpoint in float32 and requires equal
 per-step losses to 2e-5 relative (`tests/test_bench_parity.py`); perf_kit's kernels are separately tested against
