@@ -1,5 +1,23 @@
-"""Where a step's GPU time goes: a torch.profiler summary by kernel family, GPU idle share and kernels per step."""
+"""Where a step's GPU time goes: a torch.profiler summary by kernel family, GPU idle share and kernels per step; and
+the dense bf16 peak an MFU is measured against."""
 from __future__ import annotations
+
+import os
+
+# dense (non-sparse) bf16 tensor-core peaks, FLOP/s, by device-name substring
+PEAKS_BF16 = (("GH200", 989e12), ("H100", 989e12), ("H200", 989e12), ("A100", 312e12))
+
+
+def peak_bf16(dev) -> float | None:
+    """The device's dense bf16 peak in FLOP/s (MFU_PEAK_TFLOPS overrides); None on CPU and unknown GPUs."""
+    env = os.environ.get("MFU_PEAK_TFLOPS")
+    if env:
+        return float(env) * 1e12
+    import torch
+    if torch.device(dev).type != "cuda":
+        return None
+    name = torch.cuda.get_device_name(dev)
+    return next((p for k, p in PEAKS_BF16 if k in name), None)
 
 FAMILIES = (                  # order matters: "flash" contains "fla", so attention is matched first
     ("attention", ("flash", "fmha", "attention", "sdpa")),
