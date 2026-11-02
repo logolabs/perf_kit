@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "perf_kit"
 version = "0.1.0"
-description = "Fast, exact LoRA fine-tuning for Qwen3.5-style hybrid (Gated DeltaNet + attention) and dense decoders, tuned on NVIDIA GH200"
+description = "Fast, exact training engines tuned on NVIDIA GH200: LoRA for Qwen3.5-style hybrid and dense LLMs, LoRA for the Ideogram 4 DiT, and the Agate FCDM text-to-image training loop"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [{ name = "Stefan-Lucian Deleanu" }]
 maintainers = [{ name = "LogoLabs.org" }]
-keywords = ["lora", "fine-tuning", "llm", "qwen3.5", "gated-deltanet", "gh200", "mfu"]
+keywords = ["lora", "fine-tuning", "llm", "qwen3.5", "gated-deltanet", "diffusion", "dit", "ideogram", "fcdm", "text-to-image", "gh200", "mfu"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
@@ -26,13 +26,22 @@ fast = ["triton", "flash-attn>=2.8", "flash-linear-attention>=0.5", "liger-kerne
 fp8 = ["vllm"]
 test = ["pytest", "peft", "transformers>=5"]
 bench = ["peft", "playwright"]   # figures: bench/analysis/plots.py renders HTML with headless Chromium
+t2i = ["diffusers", "huggingface_hub"]   # perf_kit.t2i.fcdm.encode (SD-VAE latents), Agate releases from the Hub
+# Ideogram 4 (perf_kit.dit.ideogram4) loads through Ideogram's own package, not on PyPI:
+#   pip install git+https://github.com/ideogram-oss/ideogram4
 
 [project.scripts]
 perf-kit-train = "perf_kit.train:main"
 perf-kit-gate = "perf_kit.gate:main"
+perf-kit-ideogram4 = "perf_kit.dit.ideogram4.train:main"
+perf-kit-fcdm = "perf_kit.t2i.fcdm.train:main"
 
 [tool.setuptools.packages.find]
 include = ["perf_kit*"]
+
+[tool.setuptools.package-data]
+"perf_kit.dit.ideogram4" = ["LICENSE-IDEOGRAM4-CODE", "NOTICE.md"]
+"perf_kit.t2i.fcdm" = ["LICENSE-AGATE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

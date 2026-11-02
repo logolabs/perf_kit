@@ -3,3 +3,13 @@ Copyright 2026 LogoLabs.org
 
 This product was developed and benchmarked with compute from the EuroHPC AI Factory allocation
 EHPC-AIF-2026PG01-907 on Arrhenius (NAISS, Sweden).
+
+perf_kit/dit/ideogram4/upstream/ contains files from Ideogram 4's inference code
+(https://github.com/ideogram-oss/ideogram4), Copyright Ideogram, Inc., licensed under the Apache License,
+Version 2.0 (perf_kit/dit/ideogram4/LICENSE-IDEOGRAM4-CODE); perf_kit/dit/ideogram4/engine.py and ops.py
+re-implement that code's transformer computation. No Ideogram 4 model weights are included: they are licensed
+separately by Ideogram, Inc. under the Ideogram Non-Commercial Model Agreement, and a LoRA trained on them is a
+Model Derivative under that agreement (perf_kit/dit/ideogram4/NOTICE.md).
+
+perf_kit/t2i/fcdm/model.py contains the Agate generator code first released by LogoLabs under the MIT licence
+(perf_kit/t2i/fcdm/LICENSE-AGATE).
