@@ -3,7 +3,9 @@ message: "If you use perf_kit or its benchmark, please cite it as below."
 title: "perf_kit: fast, exact LoRA fine-tuning for hybrid Gated-DeltaNet LLMs on NVIDIA GH200"
 type: software
 authors:
-  - name: "LogoLabs.org"
+  - given-names: "Stefan-Lucian"
+    family-names: "Deleanu"
+    affiliation: "LogoLabs.org"
 version: 0.1.0
 date-released: 2026-11-02
 license: Apache-2.0

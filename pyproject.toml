@@ -10,7 +10,8 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
-authors = [{ name = "LogoLabs.org" }]
+authors = [{ name = "Stefan-Lucian Deleanu" }]
+maintainers = [{ name = "LogoLabs.org" }]
 keywords = ["lora", "fine-tuning", "llm", "qwen3.5", "gated-deltanet", "gh200", "mfu"]
 classifiers = [
     "Programming Language :: Python :: 3",

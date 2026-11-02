@@ -1,4 +1,16 @@
+<p align="center"><img src="assets/masthead.png" alt="perf_kit: 1.58x faster than ms-swift, 1.76x faster than Unsloth, 2.78x faster than transformers + PEFT, 38.6% MFU (53.9% clock-adjusted) on one GH200" width="100%"></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="Licence: Apache-2.0" src="https://img.shields.io/badge/licence-Apache--2.0-2A78D6"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-2A78D6">
+  <img alt="Hardware: NVIDIA GH200" src="https://img.shields.io/badge/benchmarked%20on-NVIDIA%20GH200-5F6670">
+  <img alt="Exactness: float64 vs transformers + PEFT" src="https://img.shields.io/badge/exactness-float64%20vs%20transformers%20%2B%20PEFT-1AAD7B">
+  <a href="report/index.html"><img alt="Technical report" src="https://img.shields.io/badge/technical%20report-HTML-1D1F24"></a>
+</p>
+
 # perf_kit
+
+*By Stefan-Lucian Deleanu ([LogoLabs.org](https://logolabs.org))*
 
 Fast, exact LoRA fine-tuning for Qwen3.5-style hybrid LLMs (Gated DeltaNet + gated attention) and dense Llama /
 Qwen decoders, built and measured on NVIDIA GH200.
@@ -37,7 +49,14 @@ Triton kernels already compiled on the node (a long job's steady state); a first
 4-GPU runs span separate nodes. End-of-run validation loss is equal across all frameworks to 0.03%; per-step
 losses match transformers + PEFT to < 6e-4.
 
+<p align="center"><img src="figures/throughput.png" alt="Tokens per second per GPU for each framework on 1 GH200 and on one 4-GPU node" width="100%"></p>
+
 27B on the same data (perf_kit only, block-FP8 checkpoint kept as FP8 codes, 1 GH200): **3,671 tokens/s, 37.6% MFU**.
+
+**Same math, not a shortcut.** Per-step training loss tracks transformers + PEFT step for step, and every framework ends
+at the same validation loss:
+
+<p align="center"><img src="figures/loss_parity.png" alt="Per-step loss of perf_kit and the other frameworks on identical step sets" width="100%"></p>
 
 Full method, ablations, negative results and caveats: **[WRITEUP.md](WRITEUP.md)**. Raw logs: `results/raw/`;
 every number above is computed by `bench/analysis/aggregate.py`.
@@ -74,6 +93,8 @@ The traps we hit, in the order you will hit them:
    (`pip install --target <dir>` works if you cannot modify the environment).
 4. **First run JIT-compiles** fla's TileLang kernels (~1-2 min per node, cached in `~/.tilelang`) and autotunes
    Triton kernels for the first tens of steps: measure throughput after warm-up, never from step 1.
+   Point `TRITON_CACHE_DIR` (and `~/.tilelang`) at a persistent shared directory so later jobs start warm: that is
+   the whole difference between the cold and warm rows in the results table.
 5. **One process per Grace-Hopper superchip, pinned to its own Grace**: `srun --ntasks-per-node 4
    --cpu-bind=cores` (+ `numactl --localalloc`). Kernel launches reportedly cost ~2.5x more CPU time on Grace than on a fast
    x86 host, so a rank whose host thread runs on the other socket loses real throughput.
@@ -129,7 +150,12 @@ torchrun --nproc_per_node 4 -m perf_kit.train ...same flags...
 7. **No host syncs inside a step.** Losses and counters accumulate on the GPU and are read at log steps; micro-batches are packed and pinned on a CPU thread and copied on a side stream.
 8. **Block-FP8 checkpoints kept as FP8 codes** (`--storage fp8`), dequantised bit-exactly to bf16 right before each GEMM by a Triton kernel (~2.9 TB/s on GH200): the same bf16 weights in half the memory.
 
-Each item, its measured contribution and what did not pay: WRITEUP.md.
+What each one is worth, measured by switching it off (two jobs per arm for most):
+
+<p align="center"><img src="figures/ablation.png" alt="Slowdown when each optimisation is switched off" width="100%"></p>
+
+Each item, its measured contribution and what did not pay: [WRITEUP.md](WRITEUP.md); the full technical report is
+[report/index.html](report/index.html).
 
 Opt-in, measured but not default: `PK_ATTN_BACKEND=fa3` (flash-attention 3), `PK_GDN_BACKEND=flashqla`, `FastQwen35(fp8_forward=True)`
 (lossy FP8 GEMMs), `--act_offload` (exact activation offload to host memory, experimental), and `PK_DISABLE=...` to
@@ -167,7 +193,15 @@ See `CITATION.cff`.
 
 Apache-2.0 (see `LICENSE` and `NOTICE`).
 
-## Acknowledgement
+## Acknowledgements
 
-Developed and benchmarked with compute from the EuroHPC AI Factory allocation EHPC-AIF-2026PG01-907 on Arrhenius
-(NAISS, Sweden).
+<p align="center"><img src="assets/acknowledgment-banner.png" alt="EuroHPC Joint Undertaking and Arrhenius" width="100%"></p>
+
+**We acknowledge EuroHPC JU for awarding the project ID EHPC-AIF-2026PG01-907 access to resources on Arrhenius GPU
+at NAISS, Sweden.** perf_kit was built, tested and benchmarked under that EuroHPC AI Factory allocation.
+
+perf_kit stands on [flash-linear-attention](https://github.com/fla-org/flash-linear-attention),
+[flash-attention](https://github.com/Dao-AILab/flash-attention), [Liger Kernel](https://github.com/linkedin/Liger-Kernel),
+[Triton](https://github.com/triton-lang/triton), [PEFT](https://github.com/huggingface/peft) and
+[transformers](https://github.com/huggingface/transformers); the comparison runs [ms-swift](https://github.com/modelscope/ms-swift)
+and [Unsloth](https://github.com/unslothai/unsloth) at their best settings we could find. Thank you to all of them.
