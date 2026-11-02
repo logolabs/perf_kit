@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use perf_kit or its benchmark, please cite it as below."
+title: "perf_kit: fast, exact LoRA fine-tuning for hybrid Gated-DeltaNet LLMs on NVIDIA GH200"
+type: software
+authors:
+  - name: "LogoLabs.org"
+version: 0.1.0
+date-released: 2026-11-02
+license: Apache-2.0
+keywords:
+  - LoRA
+  - fine-tuning
+  - Qwen3.5
+  - Gated DeltaNet
+  - GH200
+  - MFU
+abstract: >-
+  A LoRA fine-tuning engine for Qwen3.5-style hybrid (Gated DeltaNet + gated attention) and dense decoder LLMs,
+  with CPU float64 exactness tests against transformers + PEFT and a reproducible benchmark against transformers +
+  PEFT and ms-swift on NVIDIA GH200.
+notes: >-
+  Developed and benchmarked with compute from the EuroHPC AI Factory allocation EHPC-AIF-2026PG01-907 on
+  Arrhenius (NAISS).

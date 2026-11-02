@@ -5,14 +5,33 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "perf_kit"
 version = "0.1.0"
-description = "Measured-MFU LoRA fine-tuning engine for large decoder LLMs (GH200-tuned): FP8-stored exact weights, step-set-preserving rank balancing, varlen packing, fused LoRA"
+description = "Fast, exact LoRA fine-tuning for Qwen3.5-style hybrid (Gated DeltaNet + attention) and dense decoders, tuned on NVIDIA GH200"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
+authors = [{ name = "LogoLabs.org" }]
+keywords = ["lora", "fine-tuning", "llm", "qwen3.5", "gated-deltanet", "gh200", "mfu"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["torch>=2.5", "numpy", "safetensors", "transformers>=4.57"]
 
 [project.optional-dependencies]
+# fast CUDA paths; each falls back to its pure-torch reference when missing
 fast = ["triton", "flash-attn>=2.8", "flash-linear-attention>=0.5", "liger-kernel>=0.8"]
 fp8 = ["vllm"]
-test = ["pytest", "peft"]
+test = ["pytest", "peft", "transformers>=5"]
+bench = ["peft", "matplotlib"]
+
+[project.scripts]
+perf-kit-train = "perf_kit.train:main"
+perf-kit-gate = "perf_kit.gate:main"
 
 [tool.setuptools.packages.find]
 include = ["perf_kit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

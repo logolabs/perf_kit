@@ -70,6 +70,25 @@ def reference_steps(lengths: list[int], micro_bs: int, world: int, accum: int, s
     return StepSource(mbs, world, accum)
 
 
+@dataclass
+class SequentialSteps:
+    """Step s trains rows [s * global_batch, (s + 1) * global_batch) of the file, wrapping at the end (a ragged tail
+    is skipped). The order a framework with an unshuffled sampler sees, so different trainers can be compared on
+    identical step sets."""
+    n_rows: int
+    global_batch: int
+
+    @property
+    def steps_per_epoch(self) -> int:
+        return self.n_rows // self.global_batch
+
+    def step(self, s: int) -> list[int]:
+        if self.steps_per_epoch < 1:
+            raise ValueError("fewer rows than one global batch")
+        b = (s % self.steps_per_epoch) * self.global_batch
+        return list(range(b, b + self.global_batch))
+
+
 def row_cost(n_tokens: int, quad: float = 0.0) -> float:
     """Execution cost model of one row: linear in tokens (projections, MLP, linear attention) plus an optional
     quadratic term for softmax attention (quad = attention FLOPs per token^2 relative to the linear FLOPs)."""

@@ -1,6 +1,9 @@
 """perf_kit.train end to end on CPU with a tiny Qwen3 (dense) built from transformers: losses finite and falling, PEFT
-adapter written, and a run stopped at step 2 and resumed (adapter + optimizer) reproduces the uninterrupted run."""
+adapter written, a run stopped at step 2 and resumed (adapter + optimizer) reproduces the uninterrupted run, a stop
+signal ends the run at a step boundary with a resumable save, and sequential step sets train consecutive rows."""
 import json
+import signal
+import sys
 
 import pytest
 import torch
@@ -59,6 +62,16 @@ def _log(p):
     return [json.loads(l) for l in p.read_text().splitlines()]
 
 
+def _per_step(log):
+    """{step: loss} from the per-step losses of every logged window."""
+    out = {}
+    for r in log:
+        if "step_losses" in r:
+            for j, v in enumerate(r["step_losses"]):
+                out[r["step"] - len(r["step_losses"]) + 1 + j] = v
+    return out
+
+
 def test_train_cli_runs_and_resumes_exactly(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     assert T.main(_args(tmp_path, "full")) == 0
@@ -72,3 +85,51 @@ def test_train_cli_runs_and_resumes_exactly(tmp_path, monkeypatch):
                         "--resume_optim", "--optim_dir", str(tmp_path / "opt"))) == 0
     b = {r["step"]: r["loss"] for r in _log(tmp_path / "b" / "log.jsonl") if "loss" in r}
     assert set(b) == {3, 4} and all(abs(b[k] - losses[k]) < 1e-5 for k in b)
+
+
+def test_stop_signal_saves_and_resumes_exactly(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    assert T.main(_args(tmp_path, "full", "--log_every", "2")) == 0
+    full = _per_step(_log(tmp_path / "full" / "log.jsonl"))
+    assert sorted(full) == [1, 2, 3, 4]
+
+    class Raised(T.StopFlag):                         # as if SIGTERM had arrived during step 1
+        def install(self):
+            self.set, self.signum = True, 15
+            return self
+    monkeypatch.setattr(T, "StopFlag", Raised)
+    assert T.main(_args(tmp_path, "a", "--log_every", "2", "--optim_dir", str(tmp_path / "opt"))) == 0
+    log = _log(tmp_path / "a" / "log.jsonl")
+    assert any(r.get("event") == "stop_signal" and r["step"] == 1 for r in log)
+    assert (tmp_path / "a" / "step-000001" / "adapter_model.safetensors").exists()
+    assert [r for r in log if r.get("event") == "summary"][0]["stopped"] is True
+    monkeypatch.undo()
+    _setup(tmp_path, monkeypatch)
+    assert T.main(_args(tmp_path, "b", "--log_every", "2", "--init_adapter", str(tmp_path / "a" / "step-000001"),
+                        "--start_step", "1", "--resume_optim", "--optim_dir", str(tmp_path / "opt"))) == 0
+    b = _per_step(_log(tmp_path / "b" / "log.jsonl"))
+    assert sorted(b) == [2, 3, 4] and all(abs(b[k] - full[k]) < 1e-5 for k in b)
+
+
+@pytest.mark.skipif(sys.platform == "win32" or not hasattr(signal, "SIGUSR1"), reason="POSIX signals")
+def test_real_signal_sets_the_flag():
+    f = T.StopFlag().install()
+    try:
+        signal.raise_signal(signal.SIGUSR1)
+        assert f.set and f.signum == signal.SIGUSR1
+    finally:
+        signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+def test_sequential_steps_log_every_step_and_count_tokens(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    assert T.main(_args(tmp_path, "s", "--step_order", "sequential", "--log_every", "4", "--no_save")) == 0
+    log = _log(tmp_path / "s" / "log.jsonl")
+    assert not (tmp_path / "s" / "final").exists()
+    wins = [r for r in log if "win_steps" in r]
+    assert sum(w["win_steps"] for w in wins) == 4 and sum(w["win_rows"] for w in wins) == 4 * 8
+    assert sum(len(w["step_losses"]) for w in wins) == 4
+    data = [r for r in log if r.get("event") == "data"][0]
+    # sequential: 4 steps x 8 rows = the first 32 rows of the file, every token counted once
+    assert sum(w["win_tokens"] for w in wins) <= data["tokens"]

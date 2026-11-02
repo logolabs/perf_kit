@@ -1,8 +1,9 @@
 """Generic SFT data for perf_kit.train: chat JSONL rows -> token ids with labels on the completion only.
 
 Accepted rows: {"messages": [{"role": ..., "content": ...}, ...]} (the last message is the target, everything before
-it the prompt, rendered with the tokenizer's chat template and its generation prompt), or {"prompt": str,
-"completion": str} (plain concatenation). The completion is followed by the tokenizer's end-of-turn token. Rows longer
+it the prompt, rendered with the tokenizer's chat template and its generation prompt; `template_kwargs` are passed to
+the template, e.g. {"enable_thinking": false} for Qwen3 / Qwen3.5), or {"prompt": str, "completion": str} (plain
+concatenation). The completion is followed by the tokenizer's end-of-turn token. Rows longer
 than max_len are dropped, never truncated.
 
 Encoded rows are kept as one int32 array + offsets + prompt lengths (`Rows`), cached as .npz under a key of the
@@ -32,10 +33,11 @@ def end_token(tok) -> str:
     return tok.eos_token
 
 
-def encode_row(tok, row: dict, max_len: int, end: str):
+def encode_row(tok, row: dict, max_len: int, end: str, template_kwargs: dict | None = None):
     if "messages" in row:
         msgs = row["messages"]
-        prompt = tok.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True)
+        prompt = tok.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True,
+                                         **(template_kwargs or {}))
         completion = msgs[-1]["content"]
     else:
         prompt, completion = row["prompt"], row["completion"]
@@ -101,36 +103,41 @@ def read_jsonl(paths, limit: int = 0) -> list:
 _W: dict = {}
 
 
-def _init(tok_src, max_len):
+def _init(tok_src, max_len, template_kwargs=None):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(tok_src)
-    _W.update(tok=tok, max_len=max_len, end=end_token(tok))
+    _W.update(tok=tok, max_len=max_len, end=end_token(tok), kw=template_kwargs or {})
 
 
 def _chunk(rows):
-    return [encode_row(_W["tok"], r, _W["max_len"], _W["end"]) for r in rows]
+    return [encode_row(_W["tok"], r, _W["max_len"], _W["end"], _W["kw"]) for r in rows]
 
 
-def cache_key(paths, tok, max_len: int, limit: int) -> str:
+def cache_key(paths, tok, max_len: int, limit: int, template_kwargs: dict | None = None) -> str:
     files = [(os.path.abspath(p), os.path.getsize(p), int(os.path.getmtime(p))) for p in paths]
     tid = [getattr(tok, "name_or_path", ""), len(tok), str(getattr(tok, "chat_template", ""))[:4000]]
-    return hashlib.sha256(json.dumps({"f": files, "t": tid, "m": max_len, "l": limit, "v": 1}).encode()).hexdigest()[:16]
+    rec = {"f": files, "t": tid, "m": max_len, "l": limit, "v": 1}
+    if template_kwargs:
+        rec["k"] = json.dumps(template_kwargs, sort_keys=True)     # absent = the key of older caches
+    return hashlib.sha256(json.dumps(rec).encode()).hexdigest()[:16]
 
 
-def load(paths, tok, tok_src: str, max_len: int, limit: int = 0, cache_dir: str = "", procs: int = 0):
+def load(paths, tok, tok_src: str, max_len: int, limit: int = 0, cache_dir: str = "", procs: int = 0,
+         template_kwargs: dict | None = None):
     """(Rows, dropped, source). procs > 1 encodes a cache miss with a spawned process pool (tok_src reloadable)."""
-    key = cache_key(paths, tok, max_len, limit)
+    key = cache_key(paths, tok, max_len, limit, template_kwargs)
     d = Path(cache_dir) / key if cache_dir else None
     if d is not None and (d / "rows.npz").exists():
         return Rows.load(d / "rows.npz"), json.loads((d / "meta.json").read_text())["dropped"], f"cache {key}"
     rows = read_jsonl(paths, limit)
     if procs > 1:
         parts = [rows[i:i + 2000] for i in range(0, len(rows), 2000)]
-        with multiprocessing.get_context("spawn").Pool(procs, initializer=_init, initargs=(tok_src, max_len)) as pool:
+        with multiprocessing.get_context("spawn").Pool(procs, initializer=_init,
+                                                          initargs=(tok_src, max_len, template_kwargs)) as pool:
             encs = [e for part in pool.imap(_chunk, parts) for e in part]
     else:
         end = end_token(tok)
-        encs = [encode_row(tok, r, max_len, end) for r in rows]
+        encs = [encode_row(tok, r, max_len, end, template_kwargs) for r in rows]
     kept = [e for e in encs if e is not None]
     out = Rows.build(kept)
     if d is not None:

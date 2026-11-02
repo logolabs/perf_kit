@@ -187,3 +187,53 @@ def test_fp8_forward_fallback_equals_bf16_path():
     x = torch.randn(9, 256, generator=g)
     a = torch.zeros((), requires_grad=True)
     assert torch.allclose(grp(True)(x, a), grp(False)(x, a), atol=1e-5)    # CPU fallback = dequant + matmul
+
+
+def test_ckpt_policy_calibrated_from_the_measured_9b_value():
+    """The 9B case that motivated the calibration: 32 layers, ~57 GB budget. With the old fixed 0.25 MiB/token/layer
+    the plan recomputes at 8,192 tokens although the measured 0.17 fits ~10.7k tokens without any recompute."""
+    old = CkptPolicy(32, budget_gb=57.3, act_mb=0.25, in_mb=0.01)
+    assert sum(old.plan(8192)) > 0 and old.max_tokens_without_recompute() < 7400
+    new = CkptPolicy(32, budget_gb=57.3).calibrate(0.17, 0.016, margin=1.05)
+    assert new.calibrated and abs(new.act_mb - 0.1785) < 1e-9
+    assert sum(new.plan(8192)) == 0 and sum(new.plan(10000)) == 0 and sum(new.plan(12288)) > 0
+    assert 10000 < new.max_tokens_without_recompute() < 10500
+    with pytest.raises(ValueError):
+        CkptPolicy(4, 1.0).calibrate(0.01, 0.02)          # a checkpointed layer cannot store more than a full one
+
+
+def test_measure_act_mb_cpu_is_per_token_and_per_layer():
+    import transformers
+    from perf_kit.engine import measure_act_mb
+    from perf_kit.models.dense import FastDense
+    from perf_kit.weights import DictSource
+    cfg = transformers.Qwen3Config(vocab_size=101, hidden_size=48, intermediate_size=80, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, head_dim=12,
+                                   tie_word_embeddings=False, max_position_embeddings=1024)
+    torch.manual_seed(0)
+    sd = {k: v.detach() for k, v in transformers.Qwen3ForCausalLM(cfg).state_dict().items()}
+    fm = FastDense(cfg, DictSource(sd), prefix="model.", rank=4, alpha=8, storage="bf16", device="cpu",
+                   dtype=torch.float32, impl="ref")
+    fm.lora.init_new(0)
+    g = torch.Generator().manual_seed(0)
+
+    def rows(n, L):
+        out = []
+        for _ in range(n):
+            ids = torch.randint(0, 101, (L,), generator=g).tolist()
+            out.append((ids, [IGNORE] * 3 + ids[3:], [2] * L))
+        return out
+    a = measure_act_mb(fm, pack(rows(2, 40)))
+    b = measure_act_mb(fm, pack(rows(4, 40)))
+    assert a["method"] == "saved_tensors" and a["tokens"] == 80 and b["tokens"] == 160
+    assert a["act_mb"] > a["in_mb"] > 0
+    assert abs(a["act_mb"] - b["act_mb"]) / b["act_mb"] < 0.05        # linear in tokens
+    assert a["in_mb"] >= 2 * 48 * 4 / 2**20                            # at least the saved residual stream
+
+
+def test_sequential_steps_take_consecutive_rows_and_wrap():
+    s = Lo.SequentialSteps(n_rows=70, global_batch=32)
+    assert s.steps_per_epoch == 2
+    assert s.step(0) == list(range(32)) and s.step(1) == list(range(32, 64)) and s.step(2) == list(range(32))
+    with pytest.raises(ValueError):
+        Lo.SequentialSteps(10, 32).step(0)

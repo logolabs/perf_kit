@@ -30,13 +30,28 @@ def lr_cosine(step: int, total: int, peak: float, warmup: int, floor: float = 0.
 @dataclass
 class CkptPolicy:
     """Recompute only as many layers as the activation budget needs, spread evenly over the depth.
-    act_mb: stored activations per token of a NON-checkpointed layer; in_mb: per token of a checkpointed one (its
-    input). mode: "auto" | "all" | "none"."""
+    act_mb: stored activations (MiB) per token of a NON-checkpointed layer; in_mb: per token of a checkpointed one
+    (its saved input). mode: "auto" | "all" | "none".
+
+    The static defaults are conservative guesses. `measure_act_mb` measures both on the real model at start-up (what
+    perf_kit.train does by default, then `calibrate`). The old fixed 0.25 over-estimated the Qwen3.5-9B's measured
+    ~0.17 by ~50%, so recompute started while ~1/3 of the HBM was still free."""
     n_layers: int
     budget_gb: float
     act_mb: float = 0.25
     in_mb: float = 0.01
     mode: str = "auto"
+    calibrated: bool = False
+
+    def calibrate(self, act_mb: float, in_mb: float, margin: float = 1.05) -> "CkptPolicy":
+        """Use measured per-token per-layer sizes, times a small safety margin."""
+        if not (act_mb > 0 and in_mb >= 0 and act_mb > in_mb):
+            raise ValueError(f"implausible activation sizes act_mb={act_mb} in_mb={in_mb}")
+        self.act_mb, self.in_mb, self.calibrated = act_mb * margin, in_mb * margin, True
+        return self
+
+    def max_tokens_without_recompute(self) -> int:
+        return int(self.budget_gb * 1024.0 / (self.act_mb * self.n_layers))
 
     def plan(self, tokens: int) -> list[bool]:
         n = self.n_layers
@@ -49,6 +64,53 @@ class CkptPolicy:
         # (n - k) * per_full + k * per_ck <= free  ->  k >= (n * per_full - free) / (per_full - per_ck)
         k = max(0, min(n, math.ceil((n * per_full - free) / max(1e-9, per_full - per_ck))))
         return [(i + 1) * k // n > i * k // n for i in range(n)]
+
+
+def _saved_bytes(fn, tokens: int) -> int:
+    """Bytes of the activation tensors autograd saves while running fn(): unique storages whose first dim is the
+    packed token count (weights and per-row metadata excluded). Device-independent; the CPU path of measure_act_mb."""
+    seen: dict = {}
+
+    def pack_hook(t):
+        if t.dim() > 0 and t.shape[0] == tokens and not isinstance(t, torch.nn.Parameter):
+            st = t.untyped_storage()
+            seen[st.data_ptr()] = st.nbytes()
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda t: t):
+        out = fn()
+    del out
+    return sum(seen.values())
+
+
+def measure_act_mb(model, packed: Packed) -> dict:
+    """Measure CkptPolicy's inputs on the real model: run the decoder forward (with grad, no backward) on one packed
+    micro-batch, once with no layer checkpointed (-> act_mb) and once with every layer checkpointed (-> in_mb), and
+    divide the activation memory that stays alive by tokens x layers. CUDA: the caching allocator's count (ground
+    truth, includes what custom kernels keep in ctx); CPU: saved-tensor accounting. in_mb is at least the analytic size
+    of a layer's saved inputs (residual stream + pending update, model dtype). Returns {"act_mb", "in_mb", "tokens",
+    "method"} in MiB per token per layer."""
+    n, T = len(model.layers), int(packed.ids.numel())
+    cuda = packed.ids.is_cuda
+    res = {}
+    for key, ck in (("act_mb", None), ("in_mb", [True] * n)):
+        with torch.enable_grad():
+            if cuda:
+                torch.cuda.synchronize()
+                m0 = torch.cuda.memory_allocated()
+                h = model.hidden(packed, ck)
+                torch.cuda.synchronize()
+                used = torch.cuda.memory_allocated() - m0 - h.numel() * h.element_size()
+                del h
+            else:
+                used = _saved_bytes(lambda: model.hidden(packed, ck), T)
+        res[key] = max(0.0, used / 2**20 / T / n)
+    hidden = model.embed.shape[1]
+    res["in_mb"] = max(res["in_mb"], 2 * hidden * model.embed.element_size() / 2**20)
+    if cuda:
+        torch.cuda.empty_cache()
+    res.update(tokens=T, method="cuda_allocator" if cuda else "saved_tensors")
+    return res
 
 
 class Prefetcher:
@@ -151,6 +213,7 @@ class Engine:
         for g in self.opt.param_groups:
             g["lr"] = lr
         m.lora.zero_grad()
+        self.acc_step.zero_()                                           # after the step: this step's sums only
         inv = 1.0 / max(1e-9, float(layout.label_total)) if self.answer_weight != 1.0 else 1.0 / max(1, layout.label_total)
         for packed in batches:
             plan = self.ckpt.plan(int(packed.ids.numel())) if self.ckpt is not None else None

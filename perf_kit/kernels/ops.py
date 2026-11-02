@@ -7,13 +7,19 @@ references, in float64, against the transformers model itself).
                   for the projection's backward (no slicing copies)                                  | HF math
   conv_silu       fla's Triton causal_conv1d with cu_seqlens (rows never see each other)             | per-row conv
   gdn             fla chunk_gated_delta_rule, native GVA (no q/k repeat), varlen                      | per-row HF torch
-  attention       flash-attn 2 varlen, causal, GQA                                                    | per-row SDPA
-Backend switches (experiment copies; logged through available()): PK_GDN_BACKEND = fla (default) | flashqla (Qwen's
-TileLang GDN kernels; q/k L2-normalised and g/beta computed in torch first), PK_ATTN_BACKEND = fa2 (default) | fa3
-(flash-attn 3 varlen, Hopper).
+  attention       flash-attn 2 varlen, causal, GQA                                                    | per-row eager
   gated_rmsnorm   fla's fused gated RMSNorm (swish gate)                                              | HF math
 
 `impl` is "fast" or "ref"; "auto" = fast on CUDA when the library imports, else ref.
+
+Environment switches (read at import; all reported by available() and logged by perf_kit.train):
+  PK_ATTN_BACKEND = fa2 (default) | fa3      flash-attn 3 varlen (Hopper): 12% faster attention kernel at the 27B's
+                                             shapes, same error vs fp32 (attention is ~1-2% of a step)
+  PK_GDN_BACKEND  = fla (default) | flashqla Qwen's TileLang GDN kernels (q/k L2-normalised and g/beta in torch
+                                             first): measured 17% SLOWER than fla on GH200; kept to reproduce that
+  PK_DISABLE      = comma list of fast paths forced onto their reference implementation, for ablations:
+                    liger_rms, liger_add_rms, fla_conv, fla_gdn, fla_gnorm, flash, triton (the SwiGLU kernel),
+                    gdn_fused_gate (gate / beta computed in torch instead of inside fla's kernel)
 """
 from __future__ import annotations
 
@@ -25,11 +31,18 @@ import torch.nn.functional as F
 _LIBS: dict = {}
 GDN_BACKEND = os.environ.get("PK_GDN_BACKEND", "fla")
 ATTN_BACKEND = os.environ.get("PK_ATTN_BACKEND", "fa2")
+DISABLED = frozenset(x.strip() for x in os.environ.get("PK_DISABLE", "").split(",") if x.strip())
 if GDN_BACKEND not in ("fla", "flashqla") or ATTN_BACKEND not in ("fa2", "fa3"):
     raise ValueError(f"PK_GDN_BACKEND={GDN_BACKEND!r} / PK_ATTN_BACKEND={ATTN_BACKEND!r}")
+_KNOWN = {"liger_rms", "liger_add_rms", "fla_conv", "fla_gdn", "fla_gnorm", "flash", "fa3", "flashqla", "triton",
+          "gdn_fused_gate"}
+if DISABLED - _KNOWN:
+    raise ValueError(f"PK_DISABLE: unknown {sorted(DISABLED - _KNOWN)}")
 
 
 def _lib(name):
+    if name in DISABLED:
+        return None
     if name not in _LIBS:
         try:
             if name == "liger_rms":
@@ -70,7 +83,7 @@ def use_fast(impl: str, x: torch.Tensor, lib: str) -> bool:
 def available() -> dict:
     out = {k: _lib(k) is not None for k in ("liger_rms", "liger_add_rms", "fla_conv", "fla_gdn", "fla_gnorm", "flash",
                                             "triton", "fa3", "flashqla")}
-    return {**out, "gdn_backend": GDN_BACKEND, "attn_backend": ATTN_BACKEND}
+    return {**out, "gdn_backend": GDN_BACKEND, "attn_backend": ATTN_BACKEND, "disabled": sorted(DISABLED)}
 
 
 # ------------------------------------------------------------------ RMSNorm, (1 + w) offset, fp32 compute
@@ -248,7 +261,7 @@ def gdn_gated(q, k, v, a, b, A_log, dt_bias, packed, impl="auto", fused_gate=Tru
     """Qwen3.5 / Qwen3-Next Gated DeltaNet from the RAW projections: g = -exp(A_log) * softplus(a + dt_bias),
     beta = sigmoid(b). Fast path: fla computes both inside its kernels (use_gate_in_kernel /
     use_beta_sigmoid_in_kernel; ~10 fewer launches per layer per direction)."""
-    if fused_gate and GDN_BACKEND == "fla" and use_fast(impl, q, "fla_gdn"):
+    if fused_gate and "gdn_fused_gate" not in DISABLED and GDN_BACKEND == "fla" and use_fast(impl, q, "fla_gdn"):
         o, _ = _lib("fla_gdn")(q[None], k[None], v[None], g=a[None], beta=b[None], use_qk_l2norm_in_kernel=True,
                                use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
                                use_beta_sigmoid_in_kernel=True, cu_seqlens=packed.cu64, cu_seqlens_cpu=packed.cu_cpu)
