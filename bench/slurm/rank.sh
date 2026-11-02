@@ -11,6 +11,9 @@
 set -euo pipefail
 ARM=$1; shift
 export RANK=$SLURM_PROCID WORLD_SIZE=$SLURM_NTASKS LOCAL_RANK=$SLURM_LOCALID
+# torchrun's LOCAL_WORLD_SIZE: ms-swift uses it to detect DDP (without it, it falls back to device_map model parallel)
+LOCAL_WORLD_SIZE=${SLURM_NTASKS_PER_NODE:-$SLURM_NTASKS}
+export LOCAL_WORLD_SIZE=${LOCAL_WORLD_SIZE%%(*}          # Slurm may write "4(x2)"
 NUMA=""
 if command -v numactl >/dev/null 2>&1; then NUMA="numactl --localalloc"; fi
 echo "[$ARM] rank $RANK/$WORLD_SIZE on $(hostname) cpus $(taskset -cp $$ 2>/dev/null | sed 's/.*: //')"

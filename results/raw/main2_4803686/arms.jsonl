@@ -1,0 +1,10 @@
+{"arm": "pk_12288", "event": "start", "t": 1793589838.324421462, "tasks": 1}
+{"arm": "pk_12288", "event": "end", "t": 1793590468.620174557, "tasks": 1}
+{"arm": "hf_8", "event": "start", "t": 1793590468.624818675, "tasks": 1}
+{"arm": "hf_8", "event": "end", "t": 1793590989.915959033, "tasks": 1}
+{"arm": "hfx_16", "event": "start", "t": 1793590989.941287631, "tasks": 1}
+{"arm": "hfx_16", "event": "end", "t": 1793591461.164029071, "tasks": 1}
+{"arm": "hfx_4_nockpt", "event": "start", "t": 1793591461.168236857, "tasks": 1}
+{"arm": "hfx_4_nockpt", "event": "end", "t": 1793591909.573202125, "tasks": 1}
+{"arm": "swift_8_nockpt", "event": "start", "t": 1793591909.577847629, "tasks": 1}
+{"arm": "swift_8_nockpt", "event": "end", "t": 1793592377.258094847, "tasks": 1}

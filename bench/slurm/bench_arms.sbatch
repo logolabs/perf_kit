@@ -30,12 +30,13 @@ NG=${SLURM_NTASKS:-1}
 STEPS=${STEPS:-60}
 GB=${GB:-64}
 PK_MICRO=${PK_MICRO:-8192}
+PK_STORAGE=${PK_STORAGE:-bf16}              # fp8: keep a block-FP8 checkpoint's weights as FP8 codes (exact)
 HF_MICRO=${HF_MICRO:-8}
 HFX_MICRO=${HFX_MICRO:-8}
 SW_MICRO=${SW_MICRO:-8}
 ARMS=${ARMS:-pk hf hfx swift}
 JOBDIR=$RUNS/${TAG:-bench}_${SLURM_JOB_ID}
-INIT=$RUNS/_init_r16
+INIT=$RUNS/_init_r16_$(basename "$MODEL")   # one shared init adapter per model (named before any staging)
 CACHE=$RUNS/_tokcache
 mkdir -p "$JOBDIR"
 cd "${PERUN_CWD:-$RUNS}"                    # the energy monitor reads its config from the working directory
@@ -67,7 +68,7 @@ if [ "${STAGE_MODEL:-0}" = 1 ]; then         # one sequential copy to node-local
   LOCAL=${TMPDIR:-/tmp}/$USER/model_$SLURM_JOB_ID
   mkdir -p "$LOCAL"
   t0=$(date +%s)
-  cp "$MODEL"/*.json "$MODEL"/*.safetensors "$MODEL"/*.txt "$LOCAL"/ 2>/dev/null || cp "$MODEL"/* "$LOCAL"/
+  cp -L "$MODEL"/* "$LOCAL"/                 # -L: hub snapshots are symlinks
   echo "staged $MODEL -> $LOCAL in $(( $(date +%s) - t0 )) s"
   MODEL=$LOCAL
 fi
@@ -87,10 +88,12 @@ for a in $ARMS; do
   CK=--grad_ckpt; SWCK=true
   if [[ $a == *+nockpt* ]]; then CK=""; SWCK=false; fi
   name=$(echo "$a" | tr '@+' '__')
+  k=2; stem=$name
+  while [ -e "$JOBDIR/$name" ]; do name=${stem}_r$k; k=$((k + 1)); done   # the same arm again: a repeat
   stamp "$name" start
   case $base in
     pk)
-      ranks "$name" "$REPO/run_train.py" "${COMMON[@]}" --out "$JOBDIR/$name" --step_order sequential --storage bf16 \
+      ranks "$name" "$REPO/run_train.py" "${COMMON[@]}" --out "$JOBDIR/$name" --step_order sequential --storage "$PK_STORAGE" \
         --micro_tokens "${micro:-$PK_MICRO}" --no_save --eval_every 0 ${PK_EXTRA:-} || echo "=== arm $name FAILED" ;;
     hf)
       ranks "$name" "$REPO/bench/e2e/hf_peft_train.py" "${COMMON[@]}" --out "$JOBDIR/$name" \

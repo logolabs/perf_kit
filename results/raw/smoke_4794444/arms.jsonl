@@ -1,0 +1,10 @@
+{"arm": "tests", "event": "start", "t": 1793585417.841514792, "tasks": 1}
+{"arm": "tests", "event": "end", "t": 1793586177.935679136, "tasks": 1}
+{"arm": "pk", "event": "start", "t": 1793586177.947379247, "tasks": 1}
+{"arm": "pk", "event": "end", "t": 1793586840.978245128, "tasks": 1}
+{"arm": "hf", "event": "start", "t": 1793586840.980319304, "tasks": 1}
+{"arm": "hf", "event": "end", "t": 1793587065.856123744, "tasks": 1}
+{"arm": "hfx", "event": "start", "t": 1793587065.858289213, "tasks": 1}
+{"arm": "hfx", "event": "end", "t": 1793587203.236121934, "tasks": 1}
+{"arm": "swift", "event": "start", "t": 1793587203.238134960, "tasks": 1}
+{"arm": "swift", "event": "end", "t": 1793587533.933541465, "tasks": 1}

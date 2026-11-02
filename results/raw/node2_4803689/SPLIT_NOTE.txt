@@ -1,0 +1,3 @@
+pk_12288 ran twice in this job (first and last arm). Both runs appended to pk_12288/log.jsonl (the launcher then had
+no repeat suffix); the file was split at the second "config" event into pk_12288 (first run, cold Triton cache) and
+pk_12288_r2 (second run, warm cache). No line was changed. The smi stamps for both are in arms.jsonl.

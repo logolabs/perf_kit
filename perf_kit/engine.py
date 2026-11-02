@@ -93,6 +93,11 @@ def measure_act_mb(model, packed: Packed) -> dict:
     n, T = len(model.layers), int(packed.ids.numel())
     cuda = packed.ids.is_cuda
     res = {}
+    if cuda:                    # warm-up: kernels' one-time persistent allocations must not count as activations
+        with torch.enable_grad():
+            del_me = model.hidden(packed, None)
+        del del_me
+        torch.cuda.synchronize()
     for key, ck in (("act_mb", None), ("in_mb", [True] * n)):
         with torch.enable_grad():
             if cuda:

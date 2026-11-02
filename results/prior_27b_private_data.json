@@ -1,0 +1,24 @@
+{
+ "what": "Earlier internal measurements (October 2026) on a PRIVATE SFT dataset; reported for context, not reproducible from this repository. The public, reproducible benchmark is results/summary.json.",
+ "model": "Qwen3.8-27B (hybrid: 48 Gated DeltaNet + 16 gated attention layers), block-FP8 checkpoint; baselines on the bf16 dequantisation of the same weights",
+ "workload": {"lora_rank": 128, "lora_alpha": 256, "targets": "every projection", "global_batch_rows": 32,
+              "mean_tokens_per_row": 768.2, "steps": 300, "lr": 3e-5, "warmup": 50, "val_rows": 512,
+              "gpus": 4, "gpu": "GH200 120GB (power-capped module, 660 W)", "same_step_sets": "all arms except ms-swift use the identical 300 step sets"},
+ "mfu_convention": "4 x 27e9 x tokens/s/GPU / 989e12 (nameplate N, the convention used at the time)",
+ "arms": [
+  {"name": "transformers + PEFT (bf16 base, fp32 LoRA, autocast, ckpt every layer, micro 2 x accum 4)", "job": 3600083,
+   "step_s": 5.155, "mfu_4N": 0.130, "val_300": 0.6866, "peak_vram_gb": 76.3},
+  {"name": "same + bf16 LoRA copies + chunked head, micro 4 x accum 2", "job": 3646194,
+   "step_s": 4.080, "mfu_4N": 0.164, "val_300": 0.6874, "peak_vram_gb": 72.2},
+  {"name": "ms-swift 4.5.3, padding-free + flash-attn 2 + Liger, gradient checkpointing, micro 4 x accum 2", "job": 3647469,
+   "step_s": 3.70, "tokens_per_s_gpu": 1663, "mfu_4N": 0.182, "val_300": 0.6878, "peak_vram_gib_reserved": 72.7,
+   "caveat": "run WITH gradient checkpointing; on the public 9B benchmark swift was ~1.7x faster without it, which was not tried at 27B (72.7 GiB with checkpointing at micro 4)"},
+  {"name": "perf_kit (FP8-stored base, exact per-GEMM dequant; LPT ranks; 3,600-token packed micro-batches, 5% layers recomputed)", "job": 3650429,
+   "step_s": 1.82, "step_s_range": [1.74, 1.95], "mfu_4N": 0.368, "val_300": 0.6863, "val_0_150_300": [0.7033, 0.6874, 0.6863]}
+ ],
+ "power": "94% of samples software-power-capped, SM clock median 1,410 MHz, ~516 W GPU draw (job 3650429)",
+ "notes": [
+  "baseline val 0.7034 / 0.6871 / 0.6866 at steps 0 / 150 / 300; perf_kit 0.7033 / 0.6874 / 0.6863",
+  "1 GPU -> 4 GPUs cost ~3% for perf_kit at the same per-rank work (1-GPU 1.76-1.79 s/step)"
+ ]
+}

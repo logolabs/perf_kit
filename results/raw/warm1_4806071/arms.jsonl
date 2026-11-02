@@ -1,0 +1,12 @@
+{"arm": "pk_12288", "event": "start", "t": 1793593441.909348229, "tasks": 1}
+{"arm": "pk_12288", "event": "end", "t": 1793594141.129354700, "tasks": 1}
+{"arm": "pk_12288_r2", "event": "start", "t": 1793594141.133860421, "tasks": 1}
+{"arm": "pk_12288_r2", "event": "end", "t": 1793594341.581166730, "tasks": 1}
+{"arm": "pk_12288_r3", "event": "start", "t": 1793594341.585446953, "tasks": 1}
+{"arm": "pk_12288_r3", "event": "end", "t": 1793594541.805005243, "tasks": 1}
+{"arm": "unsloth_8", "event": "start", "t": 1793594541.817833792, "tasks": 1}
+{"arm": "unsloth_8", "event": "end", "t": 1793595352.910645039, "tasks": 1}
+{"arm": "unsloth_8_r2", "event": "start", "t": 1793595352.915091047, "tasks": 1}
+{"arm": "unsloth_8_r2", "event": "end", "t": 1793595776.011411257, "tasks": 1}
+{"arm": "unsloth_16", "event": "start", "t": 1793595776.015755563, "tasks": 1}
+{"arm": "unsloth_16", "event": "end", "t": 1793596325.267802148, "tasks": 1}

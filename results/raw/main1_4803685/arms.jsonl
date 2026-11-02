@@ -1,0 +1,14 @@
+{"arm": "tests", "event": "start", "t": 1793589838.320695595, "tasks": 1}
+{"arm": "tests", "event": "end", "t": 1793590319.884070811, "tasks": 1}
+{"arm": "pk_12288", "event": "start", "t": 1793590319.888405631, "tasks": 1}
+{"arm": "pk_12288", "event": "end", "t": 1793590778.854739465, "tasks": 1}
+{"arm": "hf_8", "event": "start", "t": 1793590778.879734155, "tasks": 1}
+{"arm": "hf_8", "event": "end", "t": 1793591278.337098407, "tasks": 1}
+{"arm": "hfx_16", "event": "start", "t": 1793591278.341187739, "tasks": 1}
+{"arm": "hfx_16", "event": "end", "t": 1793591757.443938733, "tasks": 1}
+{"arm": "hfx_4_nockpt", "event": "start", "t": 1793591757.448202427, "tasks": 1}
+{"arm": "hfx_4_nockpt", "event": "end", "t": 1793592174.611621956, "tasks": 1}
+{"arm": "swift_8_nockpt", "event": "start", "t": 1793592174.615548986, "tasks": 1}
+{"arm": "swift_8_nockpt", "event": "end", "t": 1793592571.043454868, "tasks": 1}
+{"arm": "unsloth_8", "event": "start", "t": 1793592571.047759290, "tasks": 1}
+{"arm": "unsloth_8", "event": "end", "t": 1793593352.434735744, "tasks": 1}

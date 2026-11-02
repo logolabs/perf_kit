@@ -1,0 +1,20 @@
+{
+ "dataset": "HuggingFaceH4/ultrachat_200k",
+ "licence": "MIT",
+ "revision": "8049631c405ae6576f93f445c6b8166f76f5505a",
+ "selection": "first user->assistant exchange of each conversation, file order, no shuffling",
+ "inputs": {
+  "data/train_sft-00000-of-00003-a3ecf92756993583.parquet": "afa8fa7426081b2a0e732fb50dbb5cd402a28ad5f0dbe66c0d996d63e7220727",
+  "data/test_sft-00000-of-00001-f7dfac4afe5b93f4.parquet": "c18fd6e77395577652bdefbc5a87044ea799e989451ecfca5c6cf977ae5c6f70"
+ },
+ "outputs": {
+  "train.jsonl": {
+   "rows": 20000,
+   "sha256": "4e87fafa0adb94c7fb99f57b89c177ef4859c2a4a8e5c1cbb64b62c71547b68d"
+  },
+  "val.jsonl": {
+   "rows": 512,
+   "sha256": "9a719e055f3f9afcc71087628570fcdea51d31941c3980a328ccf6b09d464f69"
+  }
+ }
+}

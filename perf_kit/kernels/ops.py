@@ -225,7 +225,9 @@ def conv_silu(x, w, packed, impl="auto"):
 
 def gdn_ref(q, k, v, g, beta, packed):
     """q, k [T, H, K]; v [T, HV, V]; g, beta [T, HV]. HF's torch chunked kernel per row (q/k repeated to HV)."""
+    import inspect
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as ref
+    ref = inspect.unwrap(ref)          # transformers re-routes the name to fla whenever fla imports; we want its torch math
     rep = v.shape[1] // q.shape[1]
     outs = []
     for s, e in zip(packed.cu_cpu[:-1].tolist(), packed.cu_cpu[1:].tolist()):
