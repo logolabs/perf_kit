@@ -100,13 +100,13 @@ warm-up and ran 4-5% slow both times).
 
 | removed / replaced (one at a time) | step time vs full engine | n |
 |---|---|---|
-| recompute every layer (what a standard trainer does) | +40.6% (+40.6) | 1 |
+| recompute every layer (what a standard trainer does) | +41.2% (+41.2) | 1 |
 | per-row PyTorch conv instead of fla's varlen causal conv | +20.2% (+20.3, +20.1) | 2 |
 | PyTorch RMSNorm / add + norm instead of Liger | +14.5% (+14.7, +14.4) | 2 |
 | per-row eager attention instead of flash-attn varlen | +12.5% (+12.4, +12.6) | 2 |
-| PyTorch SwiGLU instead of the fused gate|up kernel | +9.5% (+9.5) | 1 |
-| PyTorch gated RMSNorm instead of fla's | +7.1% (+7.1) | 1 |
-| bf16 LoRA grads + separate add instead of fp32-accumulating addmm | +0.3% (+0.3) | 1 |
+| PyTorch SwiGLU instead of the fused gate|up kernel | +9.9% (+9.9) | 1 |
+| PyTorch gated RMSNorm instead of fla's | +7.5% (+7.5) | 1 |
+| bf16 LoRA grads + separate add instead of fp32-accumulating addmm | +0.7% (+0.7) | 1 |
 | flash-attention 3 instead of 2 | -0.1% (-0.1, -0.1) | 2 |
 | FlashQLA GDN kernels instead of fla | -1.0% (-1.1, -0.8) | 2 |
 | GDN gate / beta in PyTorch instead of inside fla's kernel | -4.9% (-5.7, -4.1) | 2 |
@@ -160,8 +160,8 @@ tokens) reachable without hand-tuning. Past ~12.4k tokens the HBM really is full
 | torchao float8 row-wise | 3-4x slower than bf16 per projection (eager) | not used |
 | FlashQLA (TileLang GDN kernels) | 17% slower than fla's GDN fwd+bwd at the 27B shapes (kernel A/B), slightly larger error; end to end on the 9B -1.0% step time (n=2, inside noise) | `PK_GDN_BACKEND=flashqla`, not default |
 | flash-attn 3 | 12% faster attention kernel at the 27B shapes, same error; end to end on the 9B -0.1% (n=2): attention is ~1.5% of GPU time | opt-in `PK_ATTN_BACKEND=fa3` |
-| fla's in-kernel GDN gate (`use_gate_in_kernel`, our default) | 4.1-5.7% *slower* than computing gate / beta in PyTorch on the 9B (n=2), identical losses | kept default until re-measured at 27B; `PK_DISABLE=gdn_fused_gate` |
-| fp32-accumulating LoRA-gradient addmm | replacing it with bf16 grads + add: +0.3% step time at r16 (noise); kept for accuracy (no bf16 rounding of per-micro-batch grads), not speed | kept |
+| fla's in-kernel GDN gate (`use_gate_in_kernel`, our default) | 4.4-5.3% *slower* than computing gate / beta in PyTorch on the 9B (n=2), identical losses | kept default until re-measured at 27B; `PK_DISABLE=gdn_fused_gate` |
+| fp32-accumulating LoRA-gradient addmm | replacing it with bf16 grads + add: +0.7% step time at r16 (noise); kept for accuracy (no bf16 rounding of per-micro-batch grads), not speed | kept |
 | CUDA graphs / regional compile | GPU idle ~2-5% with the fused path at 27B | not pursued at 27B (might pay at small models) |
 | activation offload to Grace memory (`--act_offload`) | bit-identical (tested); the only in-situ trial (27B, 1 GPU) ran out of host memory (~102 GB per GPU job) and, with 1.5x micro-batches, out of HBM | experimental, no measured speed-up |
 | adaptive recompute without freeing memory first | slower than fixed recompute in the old trainer | superseded by the measured plan |
