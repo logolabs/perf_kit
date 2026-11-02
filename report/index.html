@@ -10,9 +10,9 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Inter+Tight:wght@600;700;800&display=block">
 <style>
 /* Layout: an A4 technical report (cover, front matter, two-column body; figures and wide tables span the page),
-   the same system as the Agate report, with the benchmark figures' blue as the accent. Prints to PDF as is. */
+   the same system as the Agate report, in the perf_kit masthead's red and black. Prints to PDF as is. */
 @page{size:A4;margin:16mm 0}
-:root{--paper:#FCFCFA;--ink:#0D0E10;--acc:#2A78D6;--accink:#1D5FB0;--mute:#666B73;--faint:#DCDEE2;--soft:#F1F3F6}
+:root{--paper:#FEFEF8;--ink:#0B0A08;--acc:#F92811;--accink:#C81E0C;--mute:#6E6A62;--faint:#D9D6CE;--soft:#F3F1EA}
 *{box-sizing:border-box}
 html{-webkit-print-color-adjust:exact;print-color-adjust:exact;background:var(--paper)}
 body{margin:0;background:var(--paper);color:var(--ink);font:400 8.9pt/1.47 "IBM Plex Sans",Arial,sans-serif;
@@ -32,8 +32,9 @@ code{background:var(--soft);padding:0 .25em;border-radius:2px}
 .cover .bar span{font:500 7.2pt "IBM Plex Mono";letter-spacing:.16em;text-transform:uppercase}
 .cover .word{margin-top:20mm;font:800 54pt/1 "Inter Tight",Arial,sans-serif;letter-spacing:-.035em}
 .cover .word span{color:var(--acc)}
+.cover .mast{display:block;width:calc(100% * 1672 / 1578);max-width:none;height:auto;margin:4mm 0 0 calc(-100% * 47 / 1578)}
 .cover h1{font:800 23pt/1.08 "Inter Tight",Arial,sans-serif;letter-spacing:-.025em;margin:11mm 0 4mm;max-width:170mm;text-wrap:balance}
-.cover .sub{font:300 12pt/1.42 "IBM Plex Sans";max-width:156mm;margin:0;color:#24262A}
+.cover .sub{font:300 12pt/1.42 "IBM Plex Sans";max-width:156mm;margin:0;color:#26241F}
 .cover .who{margin-top:9mm;display:grid;grid-template-columns:repeat(3,1fr);gap:5mm;border-top:.6pt solid var(--faint);padding-top:4mm}
 .cover .who b{display:block;font:600 9.6pt "IBM Plex Sans";margin-top:1mm}
 .cover .who div{font-size:8.6pt;line-height:1.4}
@@ -80,11 +81,11 @@ figure.w80{width:80%}
 figure.w70{width:70%}
 figure.w60{width:60%}
 figure img{width:100%;height:auto;display:block;border:.5pt solid var(--faint)}
-figcaption{font-size:7.8pt;line-height:1.42;color:#3A3D42;margin-top:1.6mm}
+figcaption{font-size:7.8pt;line-height:1.42;color:#3A3732;margin-top:1.6mm}
 figcaption b,.tcap b{font:600 7.8pt "IBM Plex Sans";color:var(--ink)}
 .tbl{column-span:all;margin:3mm 0;break-inside:avoid;overflow-x:auto}
 .tbl.narrow{column-span:none}
-.tcap{font-size:7.8pt;line-height:1.42;color:#3A3D42;margin:0 0 1.4mm;text-align:left}
+.tcap{font-size:7.8pt;line-height:1.42;color:#3A3732;margin:0 0 1.4mm;text-align:left}
 table{border-collapse:collapse;width:100%;font-size:7.8pt;line-height:1.33}
 thead{display:table-header-group}
 tr{break-inside:avoid}
@@ -137,7 +138,7 @@ a.cite{color:var(--accink)}
 <!-- ================================ COVER ================================ -->
 <section class="cover" aria-label="Cover">
   <div class="bar"><span>LogoLabs · Technical report</span><span class="acc">perf_kit 0.1.0</span><span>November 2026</span></div>
-  <div class="word" aria-hidden="true">perf<span>_</span>kit</div>
+  <img class="mast" src="img/masthead.png" alt="Perf_Kit, GPU performance toolkit by LogoLabs: less idle, more throughput. High-MFU performance tools for GH200. Tested on Arrhenius.">
   <h1>perf_kit: fast, exact LoRA fine-tuning for hybrid Gated-DeltaNet LLMs on NVIDIA GH200</h1>
   <p class="sub">Design, a reproducible benchmark against transformers + PEFT, ms-swift and Unsloth, ablations, negative results and limitations of a small LoRA training engine, built and measured on a EuroHPC AI Factory allocation.</p>
   <div class="who">
@@ -243,7 +244,7 @@ a.cite{color:var(--accink)}
 <p><b>Scaling.</b> perf_kit keeps its per-GPU throughput from one to four GPUs (12,523 → 12,198) through longest-first rank dealing and one all-reduce per step. The padded arms lose 10–45% per GPU at four GPUs, because each rank then sees only 16 rows of a 64-row step, pads more (up to 54%) and amortises its fixed per-step costs over less work.</p>
 
 <h2 class="sec" id="s3"><span class="n">3</span><span>Correctness: the same math</span></h2>
-<figure class="w70">
+<figure>
   <img src="img/loss_parity.png" alt="Per-step training loss of perf_kit and four baselines on identical batches, with the differences to perf_kit below">
   <figcaption><b>Figure 2.</b> Per-step training loss on identical batches, one GH200. Top: perf_kit, with ms-swift's 10-step means (it also trains one extra newline token per row). Bottom: the difference of each padded baseline to perf_kit, below 6e-4 at every step on a loss of about 0.95.</figcaption>
 </figure>
@@ -280,7 +281,7 @@ a.cite{color:var(--accink)}
 
 <h2 class="sec" id="s5"><span class="n">5</span><span>Ablations: what each piece is worth</span></h2>
 <p>One model load, then the same 16 steps (64 rows each) per configuration from the same LoRA init with a fresh optimizer; median step time of the last 10 steps, every step CUDA-synchronised; one GH200; 8,192-token micro-batches. Two independent jobs on different nodes for most configurations. Each job's first configuration is excluded, because it absorbs the process's JIT warm-up (4–5% slow both times).</p>
-<figure class="w80">
+<figure>
   <img src="img/ablation.png" alt="Horizontal bar chart of the step-time change when each perf_kit component is removed or replaced">
   <figcaption><b>Figure 3.</b> Step-time change against the full engine when one piece is removed or replaced (+ = slower). Bars are means, ticks the individual jobs; the reference is each job's own 8,192-token run of the full engine. Per-step losses agree across all configurations to the 3rd–4th decimal, the numerical check that each piece is exact.</figcaption>
 </figure>
@@ -308,7 +309,7 @@ a.cite{color:var(--accink)}
 <h2 class="sec" id="s6"><span class="n">6</span><span>Micro-batch size and the recompute planner</span></h2>
 <figure>
   <img src="img/micro_sweep.png" alt="Throughput and recompute share against micro-batch token budget, measured planner vs old fixed estimate">
-  <figcaption><b>Figure 4.</b> Left: tokens/s/GPU (median step) against the micro-batch token budget, one GH200. Right: the share of layers the planner recomputed. Blue: activation size measured at start-up; orange: the old fixed estimate of 0.25 MiB per token per layer.</figcaption>
+  <figcaption><b>Figure 4.</b> Left: tokens/s/GPU (median step) against the micro-batch token budget, one GH200. Right: the share of layers the planner recomputed. Red: activation size measured at start-up; black squares: the old fixed estimate of 0.25 MiB per token per layer.</figcaption>
 </figure>
 <p>perf_kit decides per micro-batch how many layers to recompute so that stored activations fit the free HBM. Version 0.0 used a fixed 0.25 MiB per token per layer. The 9B actually stores 0.157–0.158 MiB, measured at start-up in every run, so recompute began at about 7.3k tokens with a third of the HBM still free. The release measures the size on the real model with one probe forward (the CUDA allocator's count after a warm-up forward, tested against a real step) and plans with the measurement × 1.05.</p>
 <p>At 12,288-token micro-batches the old estimate recomputes 28.5% of the layers (3.03–3.09 s/step); the measured plan recomputes none (2.70–2.76 s/step): <b>11–12% faster at the same batch</b>. It also makes the fastest setting, 10–12k tokens, reachable without hand-tuning. Past about 12.4k tokens the HBM really is full and recompute starts again (16,384 tokens: 19.5% of layers recomputed, 3.14 s/step). On the 27B the same measurement gives 0.216 MiB per token per layer, so no recompute up to about 3.7k tokens on one GPU with FP8-stored weights.</p>

@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/masthead.png" alt="Perf_Kit, GPU performance toolkit by LogoLabs: less idle, more throughput. High-MFU performance tools for GH200. Tested on Arrhenius." width="100%"></p>
 
-<p align="center"><img src="assets/headline_numbers.png" alt="1.58x faster than ms-swift, 1.76x faster than Unsloth, 2.78x faster than transformers + PEFT, 38.6% MFU (53.9% clock-adjusted) on one GH200" width="100%"></p>
+<p align="center"><img src="assets/headline_numbers.png" alt="On one GH200: 1.58x faster than ms-swift (1.76x vs Unsloth, 2.78x vs transformers + PEFT), 12,523 tokens/s, 38.6% MFU (53.9% clock-adjusted), per-step loss within 6e-4 of transformers + PEFT" width="100%"></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="Licence: Apache-2.0" src="https://img.shields.io/badge/licence-Apache--2.0-F92811"></a>

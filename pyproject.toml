@@ -25,7 +25,7 @@ dependencies = ["torch>=2.5", "numpy", "safetensors", "transformers>=4.57"]
 fast = ["triton", "flash-attn>=2.8", "flash-linear-attention>=0.5", "liger-kernel>=0.8"]
 fp8 = ["vllm"]
 test = ["pytest", "peft", "transformers>=5"]
-bench = ["peft", "matplotlib"]
+bench = ["peft", "playwright"]   # figures: bench/analysis/plots.py renders HTML with headless Chromium
 
 [project.scripts]
 perf-kit-train = "perf_kit.train:main"
