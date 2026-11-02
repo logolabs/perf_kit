@@ -190,7 +190,7 @@ def main(argv=None) -> int:
                 rec["mfu_clock_adjusted"] = round(rec["mfu"] * NOMINAL_SM_MHZ / ck["sm_mhz_median"], 4)
             runs.append(rec)
         if params is not None:
-            (job / "model_params.json").write_text(json.dumps(params))
+            pass
     ablations = []
     for job in sorted(p for p in raw.iterdir() if p.is_dir()):
         log = read_jsonl(job / "ablate" / "log.jsonl")
@@ -248,7 +248,8 @@ def main(argv=None) -> int:
                                "flops": "(4 N_proj + 6 N_lora) x tokens + 4 N_head x trained targets",
                                "steady_state": f"windows after step {a.warm_steps}",
                                "first_run": f"windows after step {a.first_steps}"}}
-    (out / "summary.json").write_text(json.dumps(summary, indent=1))
+    with open(out / "summary.json", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(summary, indent=1))
     lines = ["| model | GPUs | config | Triton cache | n | tokens/s/GPU mean (min-max) | step s | MFU | clock-adj. MFU |"
              " SM MHz | peak alloc GB | val (end) | first run tok/s/GPU |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for t in table:
@@ -269,7 +270,8 @@ def main(argv=None) -> int:
         lines.append(f"| {r['run']} | {r['arm']} | {r['gpus']} | {r['tokens_per_s_gpu']:.0f} | {r['step_s']:.3f} | "
                      f"{100 * r['mfu']:.1f}% | {100 * r.get('mfu_clock_adjusted', 0):.1f}% | "
                      f"{r['clock'].get('sm_mhz_median', '')} | {r.get('vram_peak_alloc_gb')} | {vend} |")
-    (out / "summary.md").write_text("\n".join(lines) + "\n")
+    with open(out / "summary.md", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
     print("\n".join(lines))
     return 0
 
