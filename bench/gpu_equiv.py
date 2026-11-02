@@ -171,11 +171,23 @@ def case_fp8(res, dev):
     ca.sum().backward()
     ga = a.lora.grad.clone()
     del a
+    a2 = fast(cfg, sd, lora, dev, storage="bf16")          # control: the same bf16 run again
+    a2.token_ce(p).sum().backward()
+    ga2 = a2.lora.grad.clone()
+    del a2
     b = fast(cfg, sd_fp8, lora, dev, storage="fp8")
     cb = b.token_ce(p)
     cb.sum().backward()
-    res["fp8"] = {"ce_bit_equal": bool(torch.equal(ca, cb)), "grad_bit_equal": bool(torch.equal(ga, b.lora.grad)),
-                  "ce_max_diff": float((ca - cb).abs().max()), "stored": b.stored_bytes()}
+    gb = b.lora.grad
+
+    def grel(x, y):
+        return float((x - y).norm() / y.norm().clamp_min(1e-30))
+    # Some backward kernels (fla's Triton GDN backward) accumulate with atomics, so gradients are not bitwise
+    # reproducible even between two identical runs; compare fp8-vs-bf16 against that run-to-run floor.
+    res["fp8"] = {"ce_bit_equal": bool(torch.equal(ca, cb)), "grad_bit_equal": bool(torch.equal(ga, gb)),
+                  "grad_bit_equal_bf16_rerun": bool(torch.equal(ga, ga2)), "grad_rel_fp8_vs_bf16": grel(gb, ga),
+                  "grad_rel_bf16_rerun": grel(ga2, ga), "ce_max_diff": float((ca - cb).abs().max()),
+                  "stored": b.stored_bytes()}
 
 
 def case_layer(res, dev, tokens):
