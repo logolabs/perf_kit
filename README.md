@@ -1,8 +1,10 @@
-<p align="center"><img src="assets/masthead.png" alt="perf_kit: 1.58x faster than ms-swift, 1.76x faster than Unsloth, 2.78x faster than transformers + PEFT, 38.6% MFU (53.9% clock-adjusted) on one GH200" width="100%"></p>
+﻿<p align="center"><img src="assets/masthead.png" alt="Perf_Kit, GPU performance toolkit by LogoLabs: less idle, more throughput. High-MFU performance tools for GH200. Tested on Arrhenius." width="100%"></p>
+
+<p align="center"><img src="assets/headline_numbers.png" alt="1.58x faster than ms-swift, 1.76x faster than Unsloth, 2.78x faster than transformers + PEFT, 38.6% MFU (53.9% clock-adjusted) on one GH200" width="100%"></p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="Licence: Apache-2.0" src="https://img.shields.io/badge/licence-Apache--2.0-2A78D6"></a>
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-2A78D6">
+  <a href="LICENSE"><img alt="Licence: Apache-2.0" src="https://img.shields.io/badge/licence-Apache--2.0-F92811"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-F92811">
   <img alt="Hardware: NVIDIA GH200" src="https://img.shields.io/badge/benchmarked%20on-NVIDIA%20GH200-5F6670">
   <img alt="Exactness: float64 vs transformers + PEFT" src="https://img.shields.io/badge/exactness-float64%20vs%20transformers%20%2B%20PEFT-1AAD7B">
   <a href="report/index.html"><img alt="Technical report" src="https://img.shields.io/badge/technical%20report-HTML-1D1F24"></a>
