@@ -15,7 +15,9 @@
 *By Stefan-Lucian Deleanu ([LogoLabs.org](https://logolabs.org))*
 
 Fast, exact LoRA fine-tuning for Qwen3.5-style hybrid LLMs (Gated DeltaNet + gated attention) and dense Llama /
-Qwen decoders, built and measured on NVIDIA GH200.
+Qwen decoders, built and measured on NVIDIA GH200. The same approach is applied to two image models LogoLabs trains:
+a LoRA engine for the **Ideogram 4** diffusion transformer ([`perf_kit/dit/ideogram4`](#ideogram-4-dit-lora)) and
+the optimised training loop of **Agate**, LogoLabs' FCDM text-to-image model ([`perf_kit/t2i/fcdm`](#agate-fcdm-text-to-image)).
 
 perf_kit is a small training engine (~2,600 lines of Python + Triton) that computes the same loss and the same LoRA
 gradients as transformers + PEFT (tested in float64 against them) while removing most of the work around the
@@ -135,11 +137,95 @@ torchrun --nproc_per_node 4 -m perf_kit.train ...same flags...
 
 ## Supported models
 
-| family | status |
-|---|---|
-| Qwen3.5 architecture (`model_type: qwen3_5`, Gated DeltaNet + gated attention), bf16 or block-FP8 | tested on Qwen3.5-9B-Base and Qwen3.8-27B-FP8 (benchmarked, used for production runs); VLM checkpoints train their text decoder |
-| Llama 2 / 3 (incl. llama3 RoPE scaling), Mistral (no sliding window), Qwen2 / 2.5 (q/k/v bias), Qwen3 (q/k norm) | CPU float64-exact vs transformers + PEFT and GPU-checked on small random models; **not benchmarked on real checkpoints** |
-| MoE, sliding-window attention, vision towers, MTP heads, full fine-tuning, QLoRA, DoRA | not supported |
+| model | engine | status | measured speed-up / MFU (source) | number is |
+|---|---|---|---|---|
+| **Qwen3.5 hybrid** (`model_type: qwen3_5`, Gated DeltaNet + gated attention), bf16 or block-FP8; Qwen3.5-9B-Base | `perf_kit.train` | benchmarked; used for production runs; VLM checkpoints train their text decoder | 1.58x vs ms-swift, 2.78x vs transformers + PEFT; 12,523 tokens/s, 38.6% MFU on 1 GH200 (`results/summary.json`, jobs `warm1_4806071`, `main1-3`) | **public, reproducible** from `results/raw/` |
+| **Qwen3.8-27B**, block-FP8 kept as FP8 codes (`--storage fp8`) | `perf_kit.train` | benchmarked (perf_kit only); production runs | 3,671 tokens/s, 37.6% MFU on 1 GH200, public data (job `q27b_4803691`). Earlier on 4 GH200: 1.82 vs 5.155 s/step for transformers + PEFT (2.83x), 36.8% MFU (Oct 2026, `results/prior_27b_private_data.json`) | 3,671 tokens/s: **public**; the 2.83x comparison: **internal, private SFT data, not reproducible from the repo** |
+| Dense **Llama 2 / 3** (incl. llama3 RoPE scaling), **Mistral** (no sliding window), **Qwen2 / 2.5** (q/k/v bias), **Qwen3** (q/k norm) | `perf_kit.train` | CPU float64-exact vs transformers + PEFT and GPU-checked on small random models; **not benchmarked on real checkpoints** | none | |
+| **Ideogram 4** DiT, LoRA on attention + MLP (one adapter or timestep-binned adapters) | `perf_kit.dit.ideogram4` | CPU float64-exact vs Ideogram's own transformer definition; the engine continued a production run from step ~2,420 to its end at 9,138 (job 4690086) | 1.86x vs LogoLabs' reference trainer, 35.9% MFU (19.6% before) on 1 node of 4 GH200 (jobs 4689237 vs 4688445, 2026-10-31); 1.87x, 33.0% MFU on 2 nodes (4688868 vs 4687262) | **internal, private data, not reproducible from the repo** |
+| **Agate** FCDM text-to-image (the Preview 001 / 002 generator, 190.9M parameters, 256 px) | `perf_kit.t2i.fcdm` | the loop changes are defaults of LogoLabs' Agate trainer since 2026-10-11; this repository's trainer is CPU-tested | +24% images/s in the real loop (382 to 475 img/s/GPU, generator MFU 25.1% to 31.2%; job 3650209, 2026-10-10); `--steer_upsample_once` alone +12% on the isolated step (524 to 585 img/s, 33.8% to 37.7% MFU; job 3643558) | 3650209: **internal, private captions, not reproducible from the repo**; 3643558: internal run on **synthetic inputs** (no private data), logs not in the repo |
+| MoE, sliding-window attention, vision towers, MTP heads, full fine-tuning of the LLMs, QLoRA, DoRA; Agate 512 px (Preview 003), Agate LoRA | | not supported | | |
+
+The Ideogram 4 and Agate numbers were measured with LogoLabs' internal trainers wrapped around the engine code that is
+released here (`engine.py` / `ops.py`, `model.py` / `ema.py` / `text.py`); the command-line trainers in this
+repository (`perf_kit.dit.ideogram4.train`, `perf_kit.t2i.fcdm.train`) are new, generic front ends, tested on CPU and
+in a short smoke run on a consumer GPU, not yet on GH200.
+
+## Ideogram 4 DiT LoRA
+
+<p align="center"><img src="figures/ideogram4.png" alt="Ideogram 4 LoRA step time: reference trainer vs the perf_kit DiT engine on 1 GPU, 1 node and 2 nodes" width="100%"></p>
+
+`perf_kit.dit.ideogram4` trains LoRA adapters on [Ideogram 4](https://github.com/ideogram-oss/ideogram4) with perf_kit's
+techniques on a diffusion transformer: packed real tokens with flash-attention 3 varlen (no left padding computed);
+fused projections (q/k/v, w1|w3) with every adapter in one GEMM and LoRA gradients accumulated in fp32 by cuBLAS; a
+hand-written backward that keeps lean activations and recomputes only elementwise work; the FP8 checkpoint kept as
+codes and dequantised bit-exactly per GEMM; frozen adaLN / input projections / rotary tables computed once per
+micro-batch; `--split auto`, which runs a micro-batch in the fewest sub-batches that need no block recompute (exact);
+one flat fused AdamW and one all-reduce per step. `--compile` compiles only the engine's elementwise functions, so
+attention and the varlen layout never enter dynamo; `--triton_swiglu` reuses perf_kit's SwiGLU kernels.
+
+Measured on GH200 (internal, private dataset, not reproducible from this repository; `results/internal_ideogram4_2026-10.json`):
+**2.35 s vs 4.09 s per 4-image 1024 x 1024 micro-batch on one GPU (37.5% vs 21.5% MFU)**, 3.62 vs 6.72 s per step
+on one node (1.86x, per-step losses equal to the 3rd decimal on identical batches), 1.87x on two nodes. Run eagerly the
+engine is not faster than the reference; compiling its elementwise code is what pays. FP8 forward GEMMs
+(`--fp8_forward`) gave no speed-up and 10x the rounding error and are not recommended.
+
+**Licence and weights.** The weights are **not included**. Training needs Ideogram 4's weights from Ideogram's gated
+Hugging Face repository (e.g. `ideogram-ai/ideogram-4-fp8`), which requires accepting the **Ideogram Non-Commercial
+Model Agreement**; an adapter trained on them is a **Model Derivative** under that agreement (non-commercial use only,
+distribution under its terms; commercial use needs a separate agreement with Ideogram). Ideogram's inference code is
+Apache-2.0; three of its files are vendored in `perf_kit/dit/ideogram4/upstream/` as the test reference, with their
+licence. Details: [`perf_kit/dit/ideogram4/NOTICE.md`](perf_kit/dit/ideogram4/NOTICE.md).
+
+```bash
+pip install git+https://github.com/ideogram-oss/ideogram4          # Ideogram's loaders (Apache-2.0)
+hf auth login                                                      # after accepting Ideogram's licence on the Hub
+# data: my_images/captions.jsonl with {"image": "a.png", "caption": "..."} per line
+torchrun --nproc_per_node 4 -m perf_kit.dit.ideogram4.train --weights ideogram-ai/ideogram-4-fp8 \
+    --data my_images --buckets 1024x1024,1024x768,768x1024 --out runs/ideo_r32 --rank 32 --alpha 32 \
+    --batch_size 4 --grad_accum 2 --lr 5e-5 --max_steps 2000 --compile --triton_swiglu
+```
+
+- Adapters are PEFT format (one adapter: load with `peft` onto the package's transformer) or a binned format with
+  `--n_bins > 1`. `--resume` continues exactly, in the order an uninterrupted run would have used.
+- `--dataset module:function` plugs in precomputed latents + text features or another image source; `--synthetic`
+  measures throughput without loading the text encoder or VAE (see `perf_kit/dit/ideogram4/data.py`).
+- `EngineModule(engine)` stands in for the package's transformer, e.g. as `pipe.conditional_transformer` to sample.
+- `--compile` on GH200 needs a GCC >= 13 toolchain on the node (inductor's CPU wrapper did not build with the
+  system g++). The logged MFU uses the reference trainer's useful-FLOP count (`--flop_px`, 207.4 MFLOP per pixel).
+
+## Agate FCDM text-to-image
+
+<p align="center"><img src="figures/agate_loop.png" alt="Agate 256 px training loop: images per second per GPU as each loop change is added, and the steer-once change on the isolated step" width="100%"></p>
+
+`perf_kit.t2i.fcdm` holds the generator of [Agate](https://huggingface.co/Logolabs/agate-preview-002) (an FCDM
+ConvNeXt-style U-Net steered by a recurrent transformer; its code was released by LogoLabs under MIT) and a trainer
+with the loop changes that made it faster on GH200:
+
+- `--steer_upsample_once`: each level's 1x1 modulation convs commute with bilinear upsampling, so the low-rank
+  steering map is upsampled once per level instead of every block's 3C modulation maps (whose backward was 16% of the
+  step's GPU time). Same function up to float rounding (tested); opt-in.
+- `--ema_foreach` (default): the EMA as one multi-tensor lerp, bit-identical, self-checked at the first step.
+- `--compile_text` (default): the frozen text encoder's forward compiled in place (parameter names unchanged).
+- `--compile`, `--ddp_bucket_view` (default), `--ddp_static_graph` (single micro-batch steps only).
+
+Measured on GH200 (internal; `results/internal_agate_2026-10.json`): in the real 256 px loop on one node, these took
+the step from 0.335 to 0.270 s (**382 to 475 images/s per GPU, +24%; generator MFU 25.1% to 31.2%**; job 3650209,
+synthetic latents with private captions); `--steer_upsample_once` alone made the isolated training step 12% faster
+(524 to 585 images/s, 33.8% to 37.7% MFU; job 3643558, synthetic inputs). On an internal 512 px LoRA fine-tune
+(private data; the LoRA recipe is not included) `torch.compile` gave 2.19x (job 3650956).
+
+```bash
+pip install -e ".[t2i]"
+python -m perf_kit.t2i.fcdm.encode --images my_images --out shards --size 256     # SD-VAE latents + captions
+torchrun --nproc_per_node 4 -m perf_kit.t2i.fcdm.train --init Logolabs/agate-preview-002 --data shards \
+    --out runs/agate_ft --global_batch 512 --micro_batch 128 --lr 2e-5 --warmup 500 --max_steps 5000 \
+    --compile --steer_upsample_once
+```
+
+`--init` loads an Agate release (generator + its fine-tuned Ettin text encoder); `--preset agate` trains the same
+architecture from scratch. The final EMA is exported in Agate's release layout (`<out>/export/config.json` +
+`generator.safetensors`, with the text-encoder path it was trained with). `--synthetic_hw 32` measures throughput on noise latents.
 
 ## How it works (short)
 
@@ -172,8 +258,12 @@ python -m pytest -q tests        # CPU: exactness vs transformers + PEFT (float6
 python bench/gpu_equiv.py --out r.json   # one GPU: fast kernels vs transformers + PEFT at realistic head shapes
 ```
 
-On a GH200 node (with fla, flash-attn, Liger and FA3 installed) all 31 tests pass; on a CPU / Windows box without
-the GPU libraries 28 pass and the library-specific ones skip.
+On a GH200 node (with fla, flash-attn, Liger and FA3 installed) the 31 LLM tests of 0.1.0 pass. The Ideogram 4 and
+Agate tests (`tests/test_ideogram4.py`, `tests/test_fcdm.py`: float64 exactness of the DiT engine against Ideogram's
+transformer definition, recompute / split exactness, PEFT adapter round trip, the steer-once identity, bit-identical
+foreach EMA, end-to-end runs with exact resume; with Ideogram's package installed, the engine on a model built by its
+FP8 loader) run on CPU; on a Windows / x86 box with torch 2.5.1 and transformers 4.57.6 the whole suite gives
+39 passed, 5 skipped.
 
 ## Benchmark
 
@@ -183,9 +273,11 @@ analysis that produces every table and figure (`bench/analysis`). See "How to re
 
 ## Limitations
 
-GH200-only numbers (no H100 / A100 / B200 measurements), LoRA only, Qwen3.5-architecture models benchmarked (dense
-families only tested for exactness), single node, short runs, and at 9B on one GPU perf_kit is launch-bound on the
-Grace CPU. Details in WRITEUP.md.
+GH200-only numbers (no H100 / A100 / B200 measurements), LoRA only for the LLMs, Qwen3.5-architecture models
+benchmarked (dense families only tested for exactness), single node, short runs, and at 9B on one GPU perf_kit is
+launch-bound on the Grace CPU. The Ideogram 4 and Agate numbers are internal (private data or logs not in the
+repository) and were measured with internal trainers around the released engine code; the released trainers for
+them have not run on GH200 yet. Details in WRITEUP.md.
 
 ## Citation
 
@@ -193,7 +285,10 @@ See `CITATION.cff`.
 
 ## Licence
 
-Apache-2.0 (see `LICENSE` and `NOTICE`).
+Apache-2.0 (see `LICENSE` and `NOTICE`). `perf_kit/dit/ideogram4/upstream/` is Ideogram, Inc.'s Apache-2.0 code
+(`perf_kit/dit/ideogram4/LICENSE-IDEOGRAM4-CODE`); Ideogram 4's **weights are not included and not covered** by
+either licence (Ideogram Non-Commercial Model Agreement, see `perf_kit/dit/ideogram4/NOTICE.md`). The Agate generator
+code in `perf_kit/t2i/fcdm/model.py` was first released by LogoLabs under MIT (`perf_kit/t2i/fcdm/LICENSE-AGATE`).
 
 ## Acknowledgements
 

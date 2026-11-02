@@ -1,0 +1,138 @@
+{
+ "what": "Earlier internal measurements (October 2026) of the Agate FCDM training loop (perf_kit/t2i/fcdm). Part A (loop_1node) ran on synthetic latents with LogoLabs' PRIVATE captions (not reproducible from this repository); part B (step_1gpu_synthetic) ran on synthetic inputs only (no private data), but its logs are not in this repository. Source: research notes 2026-10-10 / 2026-10-11.",
+ "model": "Agate Preview 002 architecture (FCDM-T2, preset 'agate': 190,929,092 parameters), 256 px (32 x 32 x 4 latents), torch.compile on in every arm",
+ "gpu": "NVIDIA GH200 120GB, 660 W module power cap",
+ "mfu_convention": "torch FLOP counter on the uncompiled generator, forward + backward of one image, counted with --steer_upsample_once off (637.9 GFLOP per image in part B); text encoder not counted; 989 TFLOPS bf16 peak",
+ "loop_1node": {
+  "what": "the real training loop, 1 node x 4 GH200, 128 images per GPU, frozen text encoder, synthetic 32 x 32 latents with real (private) captions; steady state = median of the 25-step windows 100-225; each arm adds to the previous one",
+  "job": 3650209,
+  "rows": [
+   {
+    "arm": "A: as trained",
+    "flags": "",
+    "s_step": 0.335,
+    "img_s_gpu": 382,
+    "mfu": 0.251
+   },
+   {
+    "arm": "F1: + EMA foreach, DDP bucket view, DDP static graph",
+    "flags": "--ema_foreach --ddp_bucket_view --ddp_static_graph",
+    "s_step": 0.3235,
+    "img_s_gpu": 396,
+    "mfu": 0.259
+   },
+   {
+    "arm": "F2: + steer upsample once",
+    "flags": "--steer_upsample_once",
+    "s_step": 0.295,
+    "img_s_gpu": 433,
+    "mfu": 0.284
+   },
+   {
+    "arm": "AG: + GPU-side NaN / spike guard",
+    "flags": "(async guard; not included: no gain)",
+    "s_step": 0.296,
+    "img_s_gpu": 433,
+    "mfu": 0.284
+   },
+   {
+    "arm": "H: + compiled frozen text encoder",
+    "flags": "--compile_text",
+    "s_step": 0.27,
+    "img_s_gpu": 475,
+    "mfu": 0.312
+   }
+  ],
+  "repeat": {
+   "arm": "H",
+   "s_step": 0.267,
+   "job": 3650438
+  },
+  "host_ms_per_step": {
+   "ema": [
+    24.6,
+    1.3
+   ],
+   "text_encode": [
+    47,
+    18
+   ]
+  },
+  "kernels_per_step": [
+   7534,
+   5865
+  ],
+  "power": "SM clock median 1,710 MHz (max 1,980), GPU 519 W median, software power cap in 81% of busy samples",
+  "ema_check": "EMA foreach vs loop bit-identical on GH200 (579 tensors, max diff 0)"
+ },
+ "step_1gpu_synthetic": {
+  "what": "the training step alone, one GH200, compiled, synthetic latents and a synthetic 64-token text context, frozen text",
+  "job": 3643558,
+  "gflop_per_img": 637.9,
+  "rows": [
+   {
+    "batch": 128,
+    "base_img_s": 524,
+    "base_mfu": 0.338,
+    "once_img_s": 585,
+    "once_mfu": 0.377,
+    "base_gb": 40.7,
+    "once_gb": 40.1
+   },
+   {
+    "batch": 192,
+    "base_img_s": 503,
+    "base_mfu": 0.325,
+    "once_img_s": 570,
+    "once_mfu": 0.367,
+    "base_gb": 59.3,
+    "once_gb": 58.4
+   },
+   {
+    "batch": 256,
+    "base_img_s": 504,
+    "base_mfu": 0.325,
+    "once_img_s": 572,
+    "once_mfu": 0.369,
+    "base_gb": 77.9,
+    "once_gb": 76.7
+   }
+  ],
+  "timing_run_128": [
+   522.6,
+   587.8
+  ],
+  "kernel_share": {
+   "inductor_fused": [
+    0.405,
+    0.307
+   ],
+   "gemm_conv": [
+    0.364,
+    0.423
+   ]
+  }
+ },
+ "lora_512_compile": {
+  "what": "context: torch.compile on a 512 px LoRA fine-tune of the Agate generator (private data; the LoRA recipe is not part of this repository)",
+  "job": 3650956,
+  "eager": {
+   "s_step": 2.08,
+   "img_s_gpu": 62,
+   "gb": 61.6,
+   "loss_120": 0.1226
+  },
+  "compiled": {
+   "s_step": 0.949,
+   "img_s_gpu": 135,
+   "gb": 34.6,
+   "loss_120": 0.1223
+  },
+  "speedup": 2.19,
+  "copy_cast_kernel_share": [
+   0.435,
+   0.013
+  ]
+ },
+ "gpu_hours": 5.5
+}

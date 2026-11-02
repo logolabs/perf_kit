@@ -1,0 +1,181 @@
+{
+ "what": "Earlier internal measurements (October 2026) of the Ideogram 4 LoRA engine (perf_kit/dit/ideogram4) against LogoLabs' reference trainer, on a PRIVATE image dataset; reported for context, not reproducible from this repository (neither the data nor the reference trainer is public). Source: research notes 2026-10-31 (and 2026-10-10 / 10-11 for the reference trainer's own earlier fixes).",
+ "model": "Ideogram 4 (9.3B DiT, FP8 checkpoint ideogram-ai/ideogram-4-fp8), LoRA on attention.qkv / attention.o / feed_forward.w1-3 (rsLoRA r32, 3 timestep-binned adapters, as in the production run)",
+ "data": "private: a LogoLabs image + caption dataset (147,322 images, structured JSON captions); the 1-GPU bench uses its 1024 x 1024 bucket",
+ "gpu": "NVIDIA GH200 120GB, 660 W module power cap",
+ "mfu_convention": "the reference trainer's useful-FLOP count from torch's FLOP counter, 95.16 TFLOP per 1024 x 448 sample (pilot job 4686550) = 207.4 MFLOP per image pixel, used for every row; 989 TFLOPS bf16 peak; recompute not counted",
+ "reference": "LogoLabs' reference trainer with its own October fixes on (flash-attention 3 varlen, caption-only text encoding, activation-checkpoint budget of 90k tokens): LoRA modules under bf16 autocast, autograd backward",
+ "micro_batch_1gpu": {
+  "what": "seconds per 4-sample micro-batch (~18.3k packed tokens), one GH200, real weights, the same batches for every arm",
+  "rows": [
+   {
+    "arm": "reference trainer",
+    "s": 4.09,
+    "mfu": 0.215,
+    "job": 4688444
+   },
+   {
+    "arm": "engine, eager elementwise",
+    "s": 4.17,
+    "mfu": 0.211,
+    "mfu_derived": true,
+    "job": 4688444
+   },
+   {
+    "arm": "engine, eager, every block recomputed",
+    "s": 4.77,
+    "mfu": 0.185,
+    "mfu_derived": true,
+    "job": 4688444
+   },
+   {
+    "arm": "engine, eager + FP8 forward GEMMs (lossy)",
+    "s": 4.13,
+    "mfu": 0.213,
+    "mfu_derived": true,
+    "job": 4688444
+   },
+   {
+    "arm": "engine --compile",
+    "s": 2.58,
+    "mfu": 0.341,
+    "job": 4688622
+   },
+   {
+    "arm": "engine --compile --split auto",
+    "s": 2.43,
+    "mfu": 0.362,
+    "peak_gb": 64,
+    "job": 4688622
+   },
+   {
+    "arm": "engine --compile --split auto --triton_swiglu",
+    "s": 2.35,
+    "mfu": 0.375,
+    "job": 4689171
+   }
+  ],
+  "notes": [
+   "mfu_derived = the reference's 21.5% x 4.09 s / s (same useful FLOPs); the other MFUs are as logged",
+   "--compile measured 2.83 s in 4688444 while another arm shared the GPU, 2.58 s with the GPU to itself (4688622)",
+   "text encoder 0.14 s + VAE 0.13 s of each micro-batch (4688622)"
+  ]
+ },
+ "ab_1node": {
+  "what": "training A/B, 1 node x 4 GH200, 4 images x 2 accumulation x 4 GPUs = 32 per step, the same batches, timesteps and noise, 150 steps; median s/step over windows 30-150 including validation and sample sheets",
+  "rows": [
+   {
+    "arm": "reference trainer",
+    "s_step": 6.72,
+    "mfu": 0.196,
+    "peak_gb": 85.4,
+    "job": 4688445
+   },
+   {
+    "arm": "engine --compile (split auto)",
+    "s_step": 3.76,
+    "speedup": 1.79,
+    "mfu": 0.347,
+    "peak_gb": 86.0,
+    "loss_rel_diff_mean": 0.00068,
+    "loss_rel_diff_max": 0.0015,
+    "job": 4688623
+   },
+   {
+    "arm": "engine --compile --triton_swiglu",
+    "s_step": 3.62,
+    "speedup": 1.86,
+    "mfu": 0.359,
+    "peak_gb": 85.7,
+    "loss_rel_diff_mean": 0.00071,
+    "loss_rel_diff_max": 0.0015,
+    "job": 4689237
+   }
+  ],
+  "parity": "per-rank 10-step window losses equal to the 3rd decimal at all 15 windows; validation loss at fixed t 0.3-0.9 equal to <= 1e-4 at steps 50 / 100 / 150; t 0.1 within its own check-to-check spread"
+ },
+ "ab_2node": {
+  "what": "2 nodes x 4 GH200, the production run's layout and arguments, global batch 32, steps 40-60",
+  "reference": {
+   "s_step": [
+    3.51,
+    3.53
+   ],
+   "mfu": 0.17,
+   "job": 4687262
+  },
+  "engine": {
+   "arm": "--compile",
+   "s_step": [
+    1.85,
+    1.89
+   ],
+   "speedup": 1.87,
+   "mfu": 0.33,
+   "job": 4688868
+  }
+ },
+ "production": {
+  "what": "the production run continued on the engine (--compile --triton_swiglu), 2 nodes",
+  "s_step": 1.79,
+  "mfu": 0.355,
+  "reference_same_run": {
+   "s_step": 3.37,
+   "mfu": 0.183
+  },
+  "steps_completed": 9138,
+  "job": 4690086
+ },
+ "gradient_parity": {
+  "job": 4688444,
+  "loss_engine": 0.152538,
+  "loss_reference_fa3": 0.152475,
+  "loss_rel": 0.00041,
+  "loss_rel_reference_sdpa_vs_fa3": 0.00013,
+  "grad_rel_l2_engine_vs_ref": 0.412,
+  "grad_cos_engine_vs_ref": 0.916,
+  "grad_rel_l2_ref_sdpa_vs_fa3": 0.404,
+  "grad_cos_ref_sdpa_vs_fa3": 0.919,
+  "reading": "one 1024 x 1024 micro-batch: the engine differs from the reference by as much as the reference differs from itself under a different attention kernel (bf16 rounding floor)"
+ },
+ "fp8_forward": {
+  "job": 4688444,
+  "s": 4.13,
+  "loss_rel": 0.0039,
+  "grad_cos_vs_exact_engine": 0.847,
+  "verdict": "rejected: no speed-up, 10x the rounding floor"
+ },
+ "triton_swiglu": {
+  "job": 4689171,
+  "fwd": "bitwise equal to eager",
+  "bwd": "within 1 bf16 ulp",
+  "ms_fwd_bwd_9k_tokens": {
+   "triton": 0.51,
+   "inductor": 1.73,
+   "eager": 2.03
+  }
+ },
+ "reference_trainer_october_fixes": {
+  "what": "context: the reference trainer's own step-time fixes before the engine existed (internal, 2026-10-10 / 10-11)",
+  "one_gpu": {
+   "s_step": [
+    6.08,
+    4.54
+   ],
+   "mfu": [
+    0.184,
+    0.247
+   ],
+   "speedup": 1.34,
+   "jobs": [
+    3650401,
+    3650402
+   ]
+  },
+  "four_gpus": {
+   "speedup": 1.37,
+   "job": 3651129
+  }
+ },
+ "gpu_hours": 7.03
+}

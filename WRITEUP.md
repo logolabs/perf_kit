@@ -13,6 +13,11 @@ Losses match transformers + PEFT step by step (differences < 6e-4 on a loss of ~
 0.03%). Most of the gain comes from removing work around the GEMMs, not from new kernels; several things we
 expected to help did not, and are listed with numbers. All of it is GH200-only: no H100 numbers.
 
+The same approach, applied to the two image models LogoLabs trains, is in sections 6 and 7: a LoRA engine for the
+Ideogram 4 diffusion transformer (1.86x the reference trainer on one 4-GPU node, 35.9% MFU) and the training loop of
+Agate, an FCDM text-to-image model (+24% images per second). Those numbers are internal measurements, on private data
+or with logs that are not in this repository, and are labelled as such.
+
 ![throughput](figures/throughput.png)
 
 ## 1. The problem
@@ -261,7 +266,171 @@ step, and the host spends about as long issuing ops as the GPU spends executing 
 the larger GEMMs hide the host; GPU idle was ~2-5% there.) The GEMMs run at ~480 TFLOPS over the step, about 68% of
 what the power-capped clock allows.
 
-## 6. Limitations
+## 6. Ideogram 4 DiT LoRA (`perf_kit/dit/ideogram4`)
+
+*Internal measurements (October 2026) on a private image + caption dataset, against LogoLabs' reference trainer;
+not reproducible from this repository. Numbers: `results/internal_ideogram4_2026-10.json`, research notes
+2026-10-31.*
+
+![ideogram4](figures/ideogram4.png)
+
+Ideogram 4 is a 9.3B-parameter flow-matching diffusion transformer: 34 blocks of adaLN-modulated attention + SwiGLU
+MLP over one packed sequence of Qwen3-VL text features and 2x2-patchified VAE latents, distributed as a weight-only
+FP8 checkpoint. LoRA on attention.qkv / o and feed_forward.w1-3 again leaves almost all useful FLOPs in frozen GEMMs.
+LogoLabs' reference trainer already had its own fixes (flash-attention 3 varlen, caption-only text encoding, a tuned
+activation-checkpoint budget: 1.34x on one GPU and 1.37x on four, MFU 18.4% to 24.7%; jobs 3650401 / 3650402 /
+3651129, 2026-10-10) and still sat at ~20% MFU at 1024 x 1024.
+
+**What the engine does.** The perf_kit recipe, transposed to a DiT:
+
+1. **Packed real tokens.** The upstream layout left-pads text to the longest caption; the engine drops the padding and
+   runs every GEMM and elementwise op over real tokens, with flash-attention 3 varlen (bidirectional per sample).
+2. **Fused projections + fused (binned) LoRA, no autograd.** One GEMM per group (qkv, o, w1|w3, w2); all adapters of
+   a group in one GEMM, including several timestep-binned adapters blended per sample; LoRA gradients accumulated in
+   fp32 by `addmm(..., out_dtype=float32, out=acc)`.
+3. **A hand-written backward with lean activations.** Per block it keeps the float32 residual input, qkv, the
+   attention output + log-sum-exp, and the o / w1|w3 / w2 outputs; norms, modulation, rotary and SwiGLU are recomputed
+   in the backward (elementwise only). `--split auto` runs a micro-batch's DiT pass in the fewest sub-batches whose
+   activations fit, so no block is recomputed (exact: per-sample loss weights are unchanged, tested).
+4. **FP8 codes kept, dequantised per GEMM** (bit-exactly into a shared scratch buffer), as for the 27B LLM.
+5. **Frozen work once per micro-batch.** adaLN modulations of all 34 blocks, the text and latent input projections
+   and the rotary tables are computed once under no_grad; the final layer runs on image tokens only.
+6. **One flat fused AdamW, one all-reduce, gradient clipping on the device.**
+7. **`--compile` of the engine's own elementwise functions only.** Compiling the reference trainer's blocks failed in
+   dynamo on its varlen attention path (graph breaks, a guard error; job 4688050); the engine calls attention
+   between compiled functions, so attention and the varlen layout never enter dynamo. `--triton_swiglu` reuses perf_kit's SwiGLU
+   kernels: inductor's fused kernel for the same expression ran ~5x below memory bandwidth (0.51 ms vs 1.73 ms
+   compiled / 2.03 ms eager for forward + backward at 9.1k tokens; forward bitwise, backward within 1 bf16 ulp;
+   job 4689171).
+
+One bug in the upstream model matters for training and is handled here: the rotary `inv_freq` is built in float32
+as a non-persistent buffer and then cast to bf16 with the model, which rounds it; image tokens sit at position 65,536,
+where that rounding becomes phase errors of tens of radians. The loader restores float32 tables and the engine never
+runs the rotary under autocast.
+
+**Exactness.** On CPU in float64 (`tests/test_ideogram4.py`) the engine's loss equals the upstream transformer + a
+textbook autograd LoRA to 1e-10 relative and every LoRA gradient to < 1e-9, for one adapter, 3 binned adapters and
+4 adapters with a base-only region; recompute and split are bit-identical; a saved one-adapter LoRA loads into `peft`
+on the upstream transformer and gives the engine's forward. On GH200 with real weights (job 4688444), one 1024 x 1024
+micro-batch: loss 0.152538 vs 0.152475 (4.1e-4 relative; the reference against itself with SDPA instead of FA3:
+1.3e-4); gradient relative L2 / cosine 0.412 / 0.916 against the reference, while the reference against itself under
+a different attention kernel gives 0.404 / 0.919. The engine sits at the reference's own bf16 rounding floor.
+
+**Speed.** One GH200, 4-image micro-batches at 1024 x 1024 (~18.3k packed tokens), the same batches for every arm;
+MFU uses the reference trainer's useful-FLOP count (95.16 TFLOP per 1024 x 448 sample = 207.4 MFLOP per pixel, job
+4686550) for every row:
+
+| arm | s / micro-batch | MFU | job |
+|---|---|---|---|
+| reference trainer | 4.09 | 21.5% | 4688444 |
+| engine, eager elementwise | 4.17 | 21.1%* | 4688444 |
+| engine, eager, every block recomputed | 4.77 | 18.5%* | 4688444 |
+| engine, eager + FP8 forward GEMMs (lossy) | 4.13 | 21.3%* | 4688444 |
+| engine `--compile` | 2.58 | 34.1% | 4688622 |
+| engine `--compile --split auto` | 2.43 | 36.2% (64 GB peak) | 4688622 |
+| engine `--compile --split auto --triton_swiglu` | **2.35** | **37.5%** | 4689171 |
+
+\* computed from the reference's count (21.5% x 4.09 s / s). `--compile` measured 2.83 s in 4688444, where another
+arm shared the GPU; 2.58 s with the GPU to itself.
+
+Training A/B, one node of 4 GH200, 4 images x 2 accumulation x 4 GPUs = 32 per step, the same batches, timesteps and
+noise, 150 steps (median s/step over windows 30-150, validation and sample sheets included):
+
+| arm | s/step | MFU | loss vs reference (window mean rel. diff, mean / max) | job |
+|---|---|---|---|---|
+| reference trainer | 6.72 | 19.6% | | 4688445 |
+| engine `--compile` (split auto) | 3.76 (1.79x) | 34.7% | 6.8e-4 / 1.5e-3 | 4688623 |
+| engine `--compile --triton_swiglu` | **3.62 (1.86x)** | **35.9%** | 7.1e-4 / 1.5e-3 | 4689237 |
+
+Per-rank 10-step window losses agree to the 3rd decimal at all 15 windows, and validation loss at fixed t 0.3-0.9 to
+<= 1e-4 at steps 50 / 100 / 150 (t 0.1 within its own check-to-check spread). On two nodes with the production run's
+layout the engine took 1.85-1.89 s/step against the reference's 3.51-3.53 (1.87x; MFU 33.0% vs 17.0%; jobs 4688868 /
+4687262), and the production run then continued on it at 1.79 s/step, 35.5% MFU, to its end at step 9,138 (job
+4690086). The whole engine development, benches and A/Bs included, used 7.03 GH200-hours.
+
+**What did not pay.** Eagerly, the engine is no faster than the reference (4.17 vs 4.09 s): its elementwise work cost
+~1.3 s per micro-batch uncompiled, and compiling it removes most of that. FP8 forward GEMMs on the checkpoint codes
+with per-token activation scales (`--fp8_forward`, row-wise `torch._scaled_mm`) gave no speed-up (4.13 s) and 10x the rounding error (loss 3.9e-3 relative, gradient cosine 0.847
+against the exact engine): rejected, as at 27B.
+
+**Released code vs measured code.** `engine.py`, `ops.py` and `kernels.py` are the measured engine; the data / model
+loading and the trainer around them were rewritten for this release (no dependence on LogoLabs' trainer or data
+formats; images + captions, a plug-in hook, or synthetic data) and are tested on CPU, not yet on GH200. Ideogram 4's
+weights are not included; they are licensed under the Ideogram Non-Commercial Model Agreement, and an adapter
+trained on them is a Model Derivative under it (`perf_kit/dit/ideogram4/NOTICE.md`).
+
+## 7. The Agate FCDM training loop (`perf_kit/t2i/fcdm`)
+
+*Internal measurements (October 2026). The loop A/B ran on synthetic latents with LogoLabs' private captions and is
+not reproducible from this repository; the isolated-step measurement ran on synthetic inputs only (no private data),
+but its logs are not in this repository either. Numbers: `results/internal_agate_2026-10.json`, research notes
+2026-10-10 / 11.*
+
+![agate_loop](figures/agate_loop.png)
+
+Agate is LogoLabs' small open text-to-image model (Preview 001-002: a 190.9M-parameter generator at 256 px, code and
+weights MIT). Its generator is an FCDM U-Net of ConvNeXt-style blocks (7x7 depthwise conv, LayerNorm, per-pixel
+modulation, GRN) steered by a recurrent transformer that reads the noisy latent and the text and emits a low-rank
+"region map" every block decodes its modulation from. Unlike the LoRA engines, this is full training of a conv net,
+and the profile looked nothing like an LLM's: in a 10-step trace (1 GH200, batch 128, compiled) GEMMs and convs were
+27% of GPU time and pointwise, reduction and index_put traffic ~60%; the single largest item (16%) was the backward
+of the bilinear upsampling every block applied to its 3C modulation maps.
+
+**What changed** (all in `perf_kit/t2i/fcdm`):
+
+1. **Upsample the steering map once (`--steer_upsample_once`).** A 1x1 conv commutes with bilinear interpolation
+   (the interpolation weights sum to 1, so the bias passes through), so upsampling each level's r-channel steering
+   map once and decoding at full resolution is the same function as decoding at the planner grid and upsampling 3C
+   maps in every block, with far less data interpolated. It adds convolution FLOPs and removes memory traffic, so
+   MFU is counted with the flag off and the gain judged by images per second. Same function up to float rounding
+   (tested on CPU).
+2. **EMA as one multi-tensor lerp (`--ema_foreach`).** The same lerp per element as the per-parameter loop, so
+   bit-identical (checked on GH200: 579 tensors, max difference 0), in a few fused launches instead of one per
+   tensor: EMA host time 24.6 to 1.3 ms per step.
+3. **Compile the frozen text encoder's forward (`--compile_text`).** Compiling the bound forward, not the module,
+   keeps parameter names (wrapping the module added an `_orig_mod.` prefix and broke the first pilot): text-encode
+   host time 47 to 18 ms per step.
+4. **DDP `gradient_as_bucket_view`** (and `static_graph` for single-micro-batch steps; with gradient accumulation it
+   crashes DDP's reducer, so the trainer refuses that combination).
+
+**Real loop, one node of 4 GH200** (job 3650209; 128 images per GPU, generator compiled in every arm, frozen text
+encoder, synthetic 32 x 32 latents with private captions; steady state = median of the 25-step windows 100-225):
+
+| arm (cumulative) | s/step | img/s/GPU | generator MFU |
+|---|---|---|---|
+| A: as trained | 0.3350 | 382 | 25.1% |
+| F1: + EMA foreach, DDP bucket view, DDP static graph | 0.3235 | 396 | 25.9% |
+| F2: + steer upsample once | 0.2950 | 433 | 28.4% |
+| AG: + GPU-side NaN / spike guard | 0.2960 | 433 | 28.4% |
+| H: + compiled frozen text encoder | **0.2700** | **475 (+24%)** | **31.2%** |
+
+A repeat of H (job 3650438) gave 0.2670 s/step, i.e. ~1% run-to-run noise. The GPU-side guard (deciding NaN / spike
+skips on the device to drop one host sync per step) changed nothing and is not included. After these changes the step
+is GPU-bound (~90% compute busy) and power-capped: SM clock median 1,710 MHz of 1,980, software power cap active in
+81% of busy samples.
+
+**The step alone, one GH200** (job 3643558; compiled, synthetic latents and 64-token text context, frozen text;
+637.9 GFLOP per image for forward + backward):
+
+| per-GPU batch | as trained | `--steer_upsample_once` |
+|---|---|---|
+| 128 | 524 img/s, 33.8% MFU | **585 img/s, 37.7%** |
+| 192 | 503 img/s, 32.5% | 570 img/s, 36.7% |
+| 256 | 504 img/s, 32.5% | 572 img/s, 36.9% |
+
+A batch above 128 per GPU does not raise throughput. With the flag the share of inductor-fused kernels in GPU time
+fell from 40.5% to 30.7% and that of GEMMs / convs rose from 36.4% to 42.3%.
+
+**Compile at 512 px (context).** On an internal 512 px LoRA fine-tune of the Agate generator (private data; the LoRA
+recipe and the 512 px model are not part of this repository) `torch.compile` took the step from 2.080 to 0.949 s
+(2.19x, 62 to 135 img/s/GPU, 61.6 to 34.6 GB) at an equal loss (0.1226 vs 0.1223 at step 120); eagerly, copy and cast
+kernels were 43.5% of kernel time and only compile removed them (1.3%). The loop work used 5.50 GH200-hours.
+
+**Released code vs measured code.** `model.py` is Agate's released generator code with the steer-once change;
+`ema.py` and `text.py` are the measured EMA and text-encoder code; the trainer is a new, compact front end
+(latent shards, a hook or synthetic data; resume, export in Agate's release layout), tested on CPU, not yet on GH200.
+
+## 8. Limitations
 
 - **One machine type.** Every number is from NVIDIA GH200 120GB superchips (96 GB HBM3 per GPU) on one cluster,
   where the module is power-capped at 660 W and the SM clock under load sits at ~1.4-1.8 GHz. We have **no H100
@@ -289,10 +458,14 @@ what the power-capped clock allows.
   part of this benchmark.
 - **Energy.** Measured per job with perun (GPU module + NIC); this cluster has no independent energy meter to
   cross-check against.
+- **Ideogram 4 and Agate.** Their numbers (sections 6-7) are internal: private data, or synthetic inputs whose logs
+  are not in this repository, and LogoLabs' internal trainers around the released engine code. The released trainers
+  are tested on CPU only; there is no public, reproducible benchmark for them yet.
 
-## 7. How to reproduce
+## 9. How to reproduce
 
-Everything below runs from this repository; the only external inputs are the model weights and the public data.
+Everything below runs from this repository; the only external inputs are the model weights and the public data. (It
+covers the LLM benchmark; sections 6-7 have no public benchmark.)
 
 1. **Data** (login node, needs internet): download the two parquet files of
    [HuggingFaceH4/ultrachat_200k](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) (MIT) at

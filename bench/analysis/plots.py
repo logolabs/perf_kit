@@ -7,11 +7,14 @@ LogoLabs house style (bench/analysis/house.py: HTML + inline SVG, rendered by he
   figures/ablation.png        perf_kit with one piece removed at a time, step time vs the full engine (two repeats)
   figures/micro_sweep.png     throughput and recompute share vs micro-batch token budget, measured vs old estimate
   assets/headline_numbers.png the README's numbers strip under the masthead
+  figures/ideogram4.png       Ideogram 4 DiT LoRA engine vs the reference trainer (results/internal_ideogram4_2026-10.json,
+                              internal measurements on private data)
+  figures/agate_loop.png      Agate FCDM training-loop changes (results/internal_agate_2026-10.json, internal)
 
 The figures are also copied to report/img/ for report/index.html, and each page's HTML is kept in
 bench/analysis/html/.
 
-    python bench/analysis/plots.py [--summary results/summary.json --out figures]
+    python bench/analysis/plots.py [--summary results/summary.json --out figures] [--only ideogram4 agate_loop]
 """
 from __future__ import annotations
 
@@ -450,21 +453,167 @@ def fig_numbers(table, runs) -> str:
                 "tested on Arrhenius")
 
 
+# ----------------------------------------------------------------------------------------------- internal: DiT + FCDM
+INTERNAL = "internal measurement, not reproducible from this repository"
+
+
+def bar_sections(sections, xmax: float, ticks, fmt_tick, xcap: str, label_w: int = 470, bar_w: int = 560,
+                 val_w: int = 250, right_head: str = "") -> str:
+    """Rows of horizontal bars in the ablation figure's grid, grouped under mono section heads.
+    sections: [(head, [(label, sub, value, right_html, color, hatch)])]."""
+    cols = f"{label_w}px {bar_w}px {val_w}px"
+    X = lambda v: v / xmax * bar_w  # noqa: E731
+    RH = 46
+
+    def gridlines(h):
+        return "".join(f"<div style='position:absolute;left:{X(v):.1f}px;top:0;height:{h}px;width:1px;background:{GRID}'>"
+                       f"</div>" for v in ticks)
+    out = []
+    for k, (head, rows) in enumerate(sections):
+        out.append(f"<div style='display:grid;grid-template-columns:{cols};column-gap:20px;padding:{18 if k else 0}px 0 8px;"
+                   f"border-bottom:1.5px solid var(--ink)' class='mono'><span style='font-size:12px;color:var(--mute);"
+                   f"grid-column:span 2'>{head}</span><span style='font-size:12px;color:var(--mute);text-align:right'>"
+                   f"{right_head}</span></div>")
+        for label, sub, val, right, color, hatch in rows:
+            fill = (f"border:1.5px solid {color};background:repeating-linear-gradient(135deg,transparent 0 4px,{color} 4px 5.5px)"
+                    if hatch else f"background:{color}")
+            bar = f"<div style='position:absolute;left:0;top:{RH / 2 - 9:.0f}px;height:18px;width:{X(val):.1f}px;{fill}'></div>"
+            lab = (f"<div><div style=\"font:{700 if color == RED else 500} 15px/1.2 'Inter Tight';"
+                   f"color:{'var(--red)' if color == RED else 'var(--ink)'}\">{label}</div>"
+                   + (f"<div class='num' style='font-size:11.5px;color:var(--mute);margin-top:3px'>{sub}</div>" if sub else "")
+                   + "</div>")
+            out.append(f"<div style='display:grid;grid-template-columns:{cols};column-gap:20px;align-items:center;"
+                       f"border-bottom:1px solid var(--faint);min-height:{RH}px'>{lab}"
+                       f"<div style='position:relative;height:{RH}px'>{gridlines(RH)}{bar}</div>"
+                       f"<div class='num' style='text-align:right;font-size:14.5px'>{right}</div></div>")
+    out.append(f"<div style='display:grid;grid-template-columns:{cols};column-gap:20px'><div></div>"
+               f"<div class='axis' style='position:relative;height:22px'>"
+               + "".join(f"<span style='position:absolute;left:{X(v) - 30:.0f}px;width:60px;text-align:center;top:6px'>"
+                         f"{fmt_tick(v)}</span>" for v in ticks) + "</div><div></div></div>")
+    out.append(f"<div style='display:grid;grid-template-columns:{cols};column-gap:20px;margin-top:8px'><div></div>"
+               f"<div class='axcap' style='grid-column:span 2'>{xcap}</div></div>")
+    return "".join(out)
+
+
+def fig_ideogram4(d: dict) -> str:
+    mb, ab, ab2 = d["micro_batch_1gpu"]["rows"], d["ab_1node"]["rows"], d["ab_2node"]
+    ref_s = mb[0]["s"]
+    best = min(mb, key=lambda r: r["s"])
+    names = {"reference trainer": "reference trainer (LoRA modules, autograd)",
+             "engine, eager elementwise": "engine, eager elementwise ops",
+             "engine, eager, every block recomputed": "engine, eager, every block recomputed",
+             "engine, eager + FP8 forward GEMMs (lossy)": "engine, eager + FP8 forward GEMMs (lossy)",
+             "engine --compile": "engine --compile", "engine --compile --split auto": "+ --split auto",
+             "engine --compile --split auto --triton_swiglu": "+ --triton_swiglu"}
+
+    def color(r):
+        return GREYS[0] if r["arm"].startswith("reference") else RED if r is best else GREYS[2]
+    sec1 = [(esc(names[r["arm"]]), f"job {r['job']}", r["s"],
+             f"{r['s']:.2f} s &nbsp;<span style='color:var(--mute)'>{100 * r['mfu']:.1f}%{'*' if r.get('mfu_derived') else ''}"
+             f"</span>", color(r), False) for r in mb]
+    r0 = ab[0]
+    sec2 = [(esc("reference trainer"), f"job {r0['job']}", r0["s_step"],
+             f"{r0['s_step']:.2f} s &nbsp;<span style='color:var(--mute)'>{100 * r0['mfu']:.1f}%</span>", GREYS[0], False)]
+    for r in ab[1:]:
+        sec2.append((esc(r["arm"].replace("engine ", "engine ")), f"job {r['job']} &middot; loss rel. diff mean "
+                     f"{r['loss_rel_diff_mean']:.1e}", r["s_step"],
+                     f"{r['s_step']:.2f} s &nbsp;<span style='color:var(--mute)'>{100 * r['mfu']:.1f}% &middot; "
+                     f"{r['speedup']:.2f}&times;</span>", RED if r is ab[-1] else GREYS[2], False))
+    rf, en = ab2["reference"], ab2["engine"]
+    mid = lambda v: sum(v) / len(v)  # noqa: E731
+    sec3 = [("reference trainer", f"job {rf['job']}", mid(rf["s_step"]),
+             f"{rf['s_step'][0]:.2f}&ndash;{rf['s_step'][1]:.2f} s &nbsp;<span style='color:var(--mute)'>"
+             f"{100 * rf['mfu']:.1f}%</span>", GREYS[0], False),
+            ("engine --compile", f"job {en['job']}", mid(en["s_step"]),
+             f"{en['s_step'][0]:.2f}&ndash;{en['s_step'][1]:.2f} s &nbsp;<span style='color:var(--mute)'>"
+             f"{100 * en['mfu']:.1f}% &middot; {en['speedup']:.2f}&times;</span>", RED, False)]
+    body_rows = bar_sections(
+        [("One GH200 &middot; seconds per 4-image micro-batch, 1024&times;1024, the same batches", sec1),
+         ("One node, 4 GH200 &middot; seconds per optimizer step (32 images), the same batches, t and noise", sec2),
+         ("Two nodes, 8 GH200 &middot; seconds per step, the production run's layout", sec3)],
+        7.0, [0, 1, 2, 3, 4, 5, 6, 7], lambda v: f"{v:g} s",
+        "Seconds (shorter is faster) &middot; * MFU from the same FLOP count",
+        right_head="Time &middot; MFU")
+    legend = ("<div class='legend'>"
+              f"<span>{swatch(GREYS[0], square=True)} reference trainer (already with flash-attention 3 and a tuned "
+              f"recompute budget)</span><span>{swatch(GREYS[2], square=True)} engine variants</span>"
+              f"<span>{swatch(RED, square=True)} <span class='red'>fastest engine setting</span></span></div>")
+    body = (f"<h1>Ideogram 4 LoRA: {ab[-1]['speedup']:.2f}&times; the reference trainer, {100 * ab[-1]['mfu']:.1f}% MFU.</h1>"
+            f"<div class='sub' style='max-width:1290px'>perf_kit's DiT engine on Ideogram 4 (LoRA on attention + MLP): "
+            f"{ref_s / best['s']:.2f}&times; less time per micro-batch on one GPU ({100 * best['mfu']:.1f}% MFU), with "
+            f"per-step losses equal to the 3rd decimal on identical batches. Eager, the engine is no faster: "
+            f"compiling its elementwise code is what pays. Internal runs on a private dataset.</div>"
+            + legend + body_rows)
+    return page(body, "perf_kit &nbsp;/&nbsp; Ideogram 4 DiT LoRA", "Internal &middot; private data &middot; GH200",
+                "Source: results/internal_ideogram4_2026-10.json (research notes 2026-10-31) &middot; " + INTERNAL)
+
+
+def fig_agate(d: dict) -> str:
+    lp, st = d["loop_1node"], d["step_1gpu_synthetic"]
+    rows = lp["rows"]
+    labels = {"A": "as trained (compiled generator)", "F1": "+ EMA foreach, DDP bucket view / static graph",
+              "F2": "+ steer upsample once (exact maths)", "AG": "+ GPU-side NaN guard (no gain, not shipped)",
+              "H": "+ compiled frozen text encoder"}
+    flags = {"A": "", "F1": "--ema_foreach --ddp_bucket_view --ddp_static_graph", "F2": "--steer_upsample_once", "AG": "",
+             "H": "--compile_text"}
+    sec1 = []
+    for r in rows:
+        key = r["arm"].split(":")[0]
+        c = RED if r is rows[-1] else GREYS[0] if key == "A" else GREYS[3] if key == "AG" else GREYS[2]
+        sec1.append((f"{key} &nbsp;{esc(labels[key])}", flags[key], r["img_s_gpu"],
+                     f"{r['img_s_gpu']} &nbsp;<span style='color:var(--mute)'>{r['s_step']:.4f} s &middot; "
+                     f"{100 * r['mfu']:.1f}%</span>", c, False))
+    sec2 = []
+    for r in st["rows"]:
+        sec2.append((f"batch {r['batch']} &middot; as trained", "", r["base_img_s"],
+                     f"{r['base_img_s']} &nbsp;<span style='color:var(--mute)'>{100 * r['base_mfu']:.1f}%</span>",
+                     GREYS[0], False))
+        sec2.append((f"batch {r['batch']} &middot; --steer_upsample_once", "", r["once_img_s"],
+                     f"{r['once_img_s']} &nbsp;<span style='color:var(--mute)'>{100 * r['once_mfu']:.1f}%</span>",
+                     RED, False))
+    gain = rows[-1]["img_s_gpu"] / rows[0]["img_s_gpu"] - 1
+    body_rows = bar_sections(
+        [(f"Real loop, 4 GH200, 128 img/GPU, cumulative &middot; job {lp['job']} "
+          f"(private captions)", sec1),
+         (f"The training step alone, one GH200, synthetic latents and text &middot; job {st['job']}", sec2)],
+        700, [0, 100, 200, 300, 400, 500, 600, 700], lambda v: f"{v:,}",
+        "Images per second per GPU (longer is faster) &middot; right: img/s, s/step, generator MFU",
+        label_w=520, bar_w=520, right_head="img/s &middot; MFU")
+    legend = ("<div class='legend'>"
+              f"<span>{swatch(GREYS[0], square=True)} as trained</span>"
+              f"<span>{swatch(GREYS[2], square=True)} loop changes added one by one</span>"
+              f"<span>{swatch(RED, square=True)} <span class='red'>all of them / steer once</span></span></div>")
+    body = (f"<h1>Agate at 256 px: +{100 * gain:.0f}% images per second from four loop changes.</h1>"
+            f"<div class='sub' style='max-width:1290px'>The FCDM generator of Agate Preview 002 (190.9M parameters), "
+            f"compiled in every arm. The largest single change is mathematical, not a kernel: upsampling each level's "
+            f"low-rank steering map once instead of every block's modulation maps "
+            f"(+{100 * (st['rows'][0]['once_img_s'] / st['rows'][0]['base_img_s'] - 1):.0f}% on the isolated step). "
+            f"Internal runs.</div>" + legend + body_rows)
+    return page(body, "perf_kit &nbsp;/&nbsp; Agate FCDM training loop", "Internal &middot; GH200",
+                "Source: results/internal_agate_2026-10.json (research notes 2026-10-10 / 11) &middot; " + INTERNAL)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--summary", default=str(ROOT / "results" / "summary.json"))
     ap.add_argument("--out", default=str(ROOT / "figures"))
     ap.add_argument("--assets", default=str(ROOT / "assets"), help="where headline_numbers.png goes")
     ap.add_argument("--report_img", default=str(ROOT / "report" / "img"), help="copies for report/index.html ('' = none)")
+    ap.add_argument("--only", nargs="*", default=None, help="render only these figure names (e.g. ideogram4 agate_loop)")
     a = ap.parse_args(argv)
     s = json.loads(Path(a.summary).read_text(encoding="utf-8"))
     out = Path(a.out)
+    res = ROOT / "results"
     jobs = [(fig_throughput(s["table"], s["runs"]), out / "throughput.png"),
             (fig_loss(s["runs"]), out / "loss_parity.png"),
             (fig_ablation(s["ablations"]), out / "ablation.png"),
             (fig_sweep(s["ablations"]), out / "micro_sweep.png"),
-            (fig_numbers(s["table"], s["runs"]), Path(a.assets) / "headline_numbers.png")]
-    jobs = [(doc, p) for doc, p in jobs if doc]
+            (fig_numbers(s["table"], s["runs"]), Path(a.assets) / "headline_numbers.png"),
+            (fig_ideogram4(json.loads((res / "internal_ideogram4_2026-10.json").read_text(encoding="utf-8"))),
+             out / "ideogram4.png"),
+            (fig_agate(json.loads((res / "internal_agate_2026-10.json").read_text(encoding="utf-8"))),
+             out / "agate_loop.png")]
+    jobs = [(doc, p) for doc, p in jobs if doc and (a.only is None or p.stem in a.only)]
     render(jobs)
     if a.report_img and Path(a.report_img).is_dir():
         for _, p in jobs:
