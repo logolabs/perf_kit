@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perf_kit"
+version = "0.1.0"
+description = "Measured-MFU LoRA fine-tuning engine for large decoder LLMs (GH200-tuned): FP8-stored exact weights, step-set-preserving rank balancing, varlen packing, fused LoRA"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5", "numpy", "safetensors", "transformers>=4.57"]
+
+[project.optional-dependencies]
+fast = ["triton", "flash-attn>=2.8", "flash-linear-attention>=0.5", "liger-kernel>=0.8"]
+fp8 = ["vllm"]
+test = ["pytest", "peft"]
+
+[tool.setuptools.packages.find]
+include = ["perf_kit*"]
