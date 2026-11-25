@@ -346,7 +346,8 @@ def test_launcher_cap_pending_budget(tmp_path):
 
 def test_ddp_inside_a_worker(tmp_path):
     """A 2-rank worker (gloo DDP inside one 'job') and a 1-rank worker on one run of the example LM: only rank 0
-    touches files, every rank keeps the same step counters, all finish, the run is DONE."""
+    touches files, every rank keeps the same step counters and learning rates (inner_steps 60 > done_check_every 50,
+    so the mid-round refresh is broadcast too), all finish, the run is DONE."""
     import random
     rnd = random.Random(0)
     words = "the quick brown fox jumps over a lazy dog while the pool keeps growing".split()
@@ -358,7 +359,7 @@ def test_ddp_inside_a_worker(tmp_path):
     run = tmp_path / "run"
     args = ["--cpu", "--mode", "pool", "--out", str(run), "--train", str(tmp_path / "train.jsonl"), "--val",
             str(tmp_path / "val.jsonl"), "--total_samples", "16000", "--batch", "8", "--ctx", "32", "--dim", "32",
-            "--layers", "2", "--heads", "2", "--val_windows", "64", "--log_every", "10", "--inner_steps", "20"]
+            "--layers", "2", "--heads", "2", "--val_windows", "64", "--log_every", "10", "--inner_steps", "60"]
     base = {**os.environ, "PYTHONPATH": str(ROOT), "OMP_NUM_THREADS": "1", "USE_LIBUV": "0",
             "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(29500 + os.getpid() % 1000)}
     script = str(ROOT / "perf_kit" / "pool" / "example_lm.py")
@@ -509,7 +510,9 @@ def test_progress_est_counts_the_live_round(tmp_path):
     now = time.time()                                  # two more jobs joined (1 and 2 GPUs), mid-round
     pool.store.heartbeat("b", {"gpus": 1, "samples_per_round": 20, "joined": now})
     pool.store.heartbeat("c", {"gpus": 2, "samples_per_round": 40, "joined": now})
-    pool.sync(m, 4)                                    # step 1: not seen yet (refreshed every done_check_every)
+    pool.store.heartbeat("d", {"gpus": 1, "samples_per_round": 0, "joined": now})   # joined without step_samples:
+    pool.sync(m, 4)                                    # not counted. Step 1: b, c not seen yet (refreshed every
+                                                       # done_check_every steps)
     assert pool.progress_est == pool.progress == 4 / T
     pool.sync(m, 4)                                    # step 2: refreshed; round = 20 + 20 + 40 = 4x own
     assert pool.progress == 8 / T and pool.progress_est == pytest.approx(8 * 4 / T)

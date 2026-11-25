@@ -24,6 +24,8 @@ with a progress-based warm-up, the first 500 local steps trained at ~3 % of the 
 steps, from their heartbeats): an estimate of the samples the whole pool has trained. It is never below `progress`
 and never decreases. Drive learning-rate schedules by `progress_est`, and warm up by local steps as well
 (`local_steps`): a joining job's inner optimizer starts with empty moments. `done` depends only on applied samples.
+Pass `step_samples`: a worker that joined without it beats a round size of 0 until its first publish, so the other
+workers cannot count it during its first round, which is exactly the round progress_est is for.
 """
 from __future__ import annotations
 

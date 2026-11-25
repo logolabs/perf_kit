@@ -277,6 +277,7 @@ Then keep the run topped up with small jobs under a GPU cap and a hard GPU-hour 
 a login node and counts only its own job ids):
 
 ```bash
+export SITE_ENV=/path/site_env.sh REPO=$PWD POOL_SCRIPT=my_train.py POOL_ARGS="--pool_run /shared/runs/my_run ..."
 python -m perf_kit.pool.launch --run /shared/runs/my_run --sbatch bench/pool/pool_job.sbatch --gpus 1 \
     --max_gpus 16 --max_pending 2 --budget_gpu_hours 20 --loop 300 -- -A <account> -p <partition>
 ```
@@ -292,12 +293,14 @@ only the samples the pool has applied plus this job's own: until a job's first o
 jobs' rounds, so a warm-up driven by it runs the whole first round as if the pool were one job (in the real run
 below, the first 500 local steps trained at ~3% of the nominal learning rate). `pool.progress_est` scales the
 job's unapplied samples by the pool's live round size (from the other jobs' heartbeats, refreshed at every sync and
-every `done_check_every` steps); it is never below `progress` and never decreases. Each joining job's inner
-optimizer also starts with empty moments, hence the local warm-up (`pool.local_steps`).
+every `done_check_every` steps); it is never below `progress` and never decreases. Pass `step_samples` to `Pool`:
+a job that joined without it counts in the other jobs' round size only after its first publish, which is the very
+round this estimate is for. Each joining job's inner optimizer also starts with empty moments, hence the local
+warm-up (`pool.local_steps`).
 
 **perf_kit's loop optimisations inside each job.** The pool adds nothing to the step itself: between outer syncs,
-`pool.sync` only counts, and every `done_check_every` (50) steps rank 0 reads two small files and broadcasts them.
-The real run below used, together with the pool: `torch.compile` of the model, no host syncs in the step (losses
+`pool.sync` only counts, and every `done_check_every` (50) steps rank 0 checks the DONE file and reads the live
+jobs' heartbeats (one small JSON file per job), then broadcasts the result. The real run below used, together with the pool: `torch.compile` of the model, no host syncs in the step (losses
 summed on the GPU, read at log steps), data prepared ahead on a side CUDA stream, recompute of one branch to fit
 memory, `channels_last`, fused AdamW, and DDP gradients as bucket views inside each job.
 

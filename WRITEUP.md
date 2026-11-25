@@ -596,15 +596,16 @@ What this shows, and does not:
 **Schedule pitfall (found in real use, fixed).** `Pool.progress` is the applied samples at the worker's last pull
 plus its own unapplied samples. Until a worker's first outer sync nothing of the other workers is applied, so a
 schedule driven by it runs the first round of a fresh run (and a late joiner's first round) as if the pool were
-this one job: in the real run below, with a progress-based warm-up, the first 500 local steps of each job trained at
+this one job: in the real run below, with a progress-based warm-up, the first 500 local steps trained at
 ~3% of the nominal learning rate. `Pool.progress_est` (new; `progress` keeps its meaning) scales the worker's
 unapplied samples by R / r, where R is the pool's live round size (the other workers publishing on time, from their
 heartbeats, refreshed at every pull and every `done_check_every` steps and broadcast to every rank, plus this
 worker) and r this worker's own samples per round (from `step_samples`, or measured from its pace). It assumes every
 live worker is as far into its round as this one, is never below `progress`, never decreases (it holds its
 end-of-round value until the applied samples catch up), and equals `progress` for a pool of one; `done` still
-depends only on applied samples. Tested on CPU, including that both ranks of a 2-rank job use the same learning
-rates. Each joining job's inner AdamW also starts with empty moments, so warm up by local steps as well
+depends only on applied samples. A worker that joined without `step_samples` beats a round size of 0 until its
+first publish, so the others cannot count it during exactly the round this is for: pass `step_samples`. Tested on
+CPU, including that both ranks of a 2-rank job use the same learning rates. Each joining job's inner AdamW also starts with empty moments, so warm up by local steps as well
 (`Pool.local_steps`; `example_lm.py --local_warmup N`).
 
 **Real use (snapshot of 2026-11-25, run in progress, no quality claim yet).** A 104 M-parameter image VAE at
@@ -617,7 +618,8 @@ CUDA stream, recompute of one branch to fit memory, `channels_last`, fused AdamW
 inside each job. Its pool-side choices: the schedule follows pool progress, data seeds include the worker index
 (`Pool.index`), validation runs in whichever job wins `Pool.claim(f"val_{k}")`, and a final claim job exports the
 global weights (`Pool.load_global`). The pool adds nothing to the step: between outer syncs `Pool.sync` only counts,
-and every `done_check_every` steps rank 0 reads two small files and broadcasts them.
+and every `done_check_every` steps rank 0 checks the DONE file and reads the live jobs' heartbeats (one small JSON
+file per job), then broadcasts the result.
 
 Compute for this section (smoke tests, the hung first smoke, the repeats, the evaluation job): 2.29 GPU-hours (sacct).
 
