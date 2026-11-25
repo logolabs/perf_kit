@@ -18,6 +18,8 @@ Fast, exact LoRA fine-tuning for Qwen3.5-style hybrid LLMs (Gated DeltaNet + gat
 Qwen decoders, built and measured on NVIDIA GH200. The same approach is applied to two image models LogoLabs trains:
 a LoRA engine for the **Ideogram 4** diffusion transformer ([`perf_kit/dit/ideogram4`](#ideogram-4-dit-lora)) and
 the optimised training loop of **Agate**, LogoLabs' FCDM text-to-image model ([`perf_kit/t2i/fcdm`](#agate-fcdm-text-to-image)).
+An advanced mode, [`perf_kit/pool`](#advanced-mode-growable-gpu-pool-perf_kitpool), trains one run on many small Slurm jobs
+that join and leave at any time: it is intentionally designed to maximise the use of GPUs on partly used nodes.
 
 perf_kit is a small training engine (~2,600 lines of Python + Triton) that computes the same loss and the same LoRA
 gradients as transformers + PEFT (tested in float64 against them) while removing most of the work around the
@@ -227,6 +229,118 @@ torchrun --nproc_per_node 4 -m perf_kit.t2i.fcdm.train --init Logolabs/agate-pre
 architecture from scratch. The final EMA is exported in Agate's release layout (`<out>/export/config.json` +
 `generator.safetensors`, with the text-encoder path it was trained with). `--synthetic_hw 32` measures throughput on noise latents.
 
+## Advanced mode: growable GPU pool (`perf_kit/pool`)
+
+**What it is for.** An opt-in mode, intentionally designed to maximise the use of GPUs that are only partly used:
+the free GPUs on partly allocated nodes and the short free windows of a busy cluster, which a job asking for whole
+nodes cannot use. Many small Slurm jobs (each 1..N GPUs with ordinary DDP and perf_kit's loop optimisations inside,
+at most 4 nodes) train ONE run: they join and leave at any time, a dying job costs only its unfinished round, and a
+big job can join the same run when it finally starts. On Arrhenius on 2026-11-24 the scheduler estimated 2.5 h for
+a 4-GPU node (those jobs actually waited 41 s to 17 min) while the small jobs waited 5 s to 2.7 min.
+
+**How it works.** Between jobs there is no NCCL and no server: each job trains `inner_steps` local steps from the
+current global weights and drops its pseudo-gradient (global minus local) into a run folder on the shared
+filesystem; whoever syncs next folds the inbox into a new global version with an outer Nesterov step (DiLoCo,
+Douillard et al. 2023, [arXiv 2311.08105](https://arxiv.org/abs/2311.08105)) in its asynchronous Delayed-Nesterov
+form (Liu et al. 2024, "Asynchronous Local-SGD Training for Language Modeling",
+[arXiv 2401.09135](https://arxiv.org/abs/2401.09135)), each contribution weighted by its samples (FedAvg's
+sample-weighted mean, McMahan et al. 2017, [arXiv 1602.05629](https://arxiv.org/abs/1602.05629)), so a 2-GPU job
+counts as two 1-GPU jobs. Contributions more than 4 rounds stale are dropped; nobody ever waits for a job.
+
+**When not to use it.**
+- Short runs. With few outer rounds the outer momentum has nothing to average: at 400 k samples (6 outer rounds) the
+  pool reached 1.577 bits/byte against 1.365 for DDP (table below); the runs that matched DDP completed 8-13 outer
+  rounds. Plan for at least that many (a hypothesis from one run per point, not a measured threshold).
+- When whole nodes start quickly. Synchronous DDP is simpler and cost 7% fewer GPU-hours in the comparison (every
+  pool job pays its own start-up and final evaluation, and 4-9% of trained samples were never applied).
+- Very large models without tuning: every round writes the delta and reads the newest weights over the shared
+  filesystem (0.7-0.9 s at 85 M parameters; larger models were not measured).
+
+**How to launch.** In the training loop:
+
+```python
+from perf_kit.pool import Pool
+pool = Pool("/shared/runs/my_run", model, inner_steps=500, total_samples=50_000_000, gpus=world_size,
+            step_samples=global_batch, max_gpus=16)       # joins (or creates) the run, pulls the global weights
+if pool.full or pool.done:
+    raise SystemExit                                      # the pool already holds max_gpus, or the run is over
+while not pool.done:
+    loss = train_step(model, batch(seed=pool.seed()))     # the seed differs per job and per round
+    set_lr(schedule(pool.progress_est)                    # pool-wide progress: a late joiner does not restart
+           * min(1.0, (pool.local_steps + 1) / 200))      # ... plus a local warm-up for its fresh inner optimizer
+    pool.sync(model, global_batch)                        # every inner_steps calls: publish, apply, pull
+pool.close(model)                                         # publishes the partial round and leaves
+pool.load_global(model)                                   # the final weights (heavy-ball iterate) to evaluate / ship
+```
+
+Then keep the run topped up with small jobs under a GPU cap and a hard GPU-hour budget (no torch needed, it runs on
+a login node and counts only its own job ids):
+
+```bash
+python -m perf_kit.pool.launch --run /shared/runs/my_run --sbatch bench/pool/pool_job.sbatch --gpus 1 \
+    --max_gpus 16 --max_pending 2 --budget_gpu_hours 20 --loop 300 -- -A <account> -p <partition>
+```
+
+`bench/pool/pool_job.sbatch` runs one pool job (one task per GPU, site specifics from `$SITE_ENV`, see
+`bench/slurm/site_env.example.sh`; energy monitor on local rank 0 when `$PERUN` is set); `POOL_TOPUP` lets each job
+submit the next one itself. `perf_kit/pool/example_lm.py` is the worked example (a byte-level GPT, DDP or pool mode,
+same code). Work only one job should do, such as validation every N versions, goes through `pool.claim(name)`,
+which survives the job that would have done it leaving.
+
+**Pitfall: schedule by `progress_est`, and warm up by local steps as well.** `pool.progress` is exact but counts
+only the samples the pool has applied plus this job's own: until a job's first outer sync it cannot see the other
+jobs' rounds, so a warm-up driven by it runs the whole first round as if the pool were one job (in the real run
+below, the first 500 local steps trained at ~3% of the nominal learning rate). `pool.progress_est` scales the
+job's unapplied samples by the pool's live round size (from the other jobs' heartbeats, refreshed at every sync and
+every `done_check_every` steps); it is never below `progress` and never decreases. Each joining job's inner
+optimizer also starts with empty moments, hence the local warm-up (`pool.local_steps`).
+
+**perf_kit's loop optimisations inside each job.** The pool adds nothing to the step itself: between outer syncs,
+`pool.sync` only counts, and every `done_check_every` (50) steps rank 0 reads two small files and broadcasts them.
+The real run below used, together with the pool: `torch.compile` of the model, no host syncs in the step (losses
+summed on the GPU, read at log steps), data prepared ahead on a side CUDA stream, recompute of one branch to fit
+memory, `channels_last`, fused AdamW, and DDP gradients as bucket views inside each job.
+
+**Measured comparison** (Arrhenius GH200, byte-level GPT of 85 M parameters, UltraChat single-turn text, bits per
+byte on 2,048 fixed validation windows; DDP = one 4-GPU job; pool = four jobs of 1, 2, 1 and 2 GPUs started at
+different times, the third hard-killed mid-round in every repeat; same total samples; these runs scheduled by
+`progress`, before `progress_est` existed; details in [WRITEUP.md section 10](WRITEUP.md#10-advanced-mode-growable-gpu-pool-perf_kitpool)):
+
+| run (1.2 M samples) | val bpb (pool: exported x) | pool: stored look-ahead | GPU-h | busy / idle / sync GPU-h | wall start to end | queue wait (from eligible) | samples trained / applied |
+|---|---|---|---|---|---|---|---|
+| DDP 4 GPUs, r1 (job 5712506) | 1.3327 | | 0.279 | 0.221 / 0.058 / 0 | 251 s | 41 s | 1.20 M / 1.20 M |
+| DDP 4 GPUs, r2 (5713256) | 1.3350 | | 0.290 | 0.223 / 0.067 / 0 | 261 s | 642 s | 1.20 M / 1.20 M |
+| pool 1+2+1+2, r1 (5712507-10) | 1.2955 | 1.3350 | 0.323 | 0.249 / 0.074 / 0.010 | 382 s | 41, 161, 101, 101 s | 1.34 M / 1.22 M |
+| pool 1+2+1+2, r2 (5713257-60) | 1.3626 | 1.7634 | 0.301 | 0.242 / 0.060 / 0.011 | 288 s | 28, 27, 5, 5 s | 1.30 M / 1.22 M |
+| pool 1+2+1+2, r4 (5714236-39) | 1.2993 | 1.3396 | 0.293 | 0.236 / 0.057 / 0.010 | 320 s | 12, 72, 12, 12 s | 1.30 M / 1.25 M |
+
+| run (400 k samples, H = 250, starts 0 / 30 / 60 / 90 s, kill after 40 s) | val bpb | look-ahead | GPU-h | wall | queue wait |
+|---|---|---|---|---|---|
+| DDP 4 GPUs, r3 (5713261) | 1.3645 | | 0.142 | 128 s | 1,002 s |
+| pool 1+2+1+2, r3 (5713262-65) | 1.5766 | 1.7878 | 0.134 | 150 s | 28, 58, 28, 35 s |
+| pool 1+2+1+2, r5, outer momentum 0.5 (5715039-42) | 1.3975 | 1.3911 | 0.165 | 204 s | 54, 144, 54, 84 s |
+
+At 1.2 M samples no quality loss was measured (pool 1.296 / 1.363 / 1.299, n = 3, against DDP 1.333 / 1.335,
+n = 2; the pool's spread is much larger) at +7% GPU-hours; the short run lost clearly. Time from first eligibility
+to the final model: DDP 292 / 903 / 1,130 s, pool 423 / 316 / 332 / 178 s.
+
+**Real use** (snapshot of 2026-11-25, run in progress, no quality claim yet). A 104 M-parameter image VAE at
+1024 px trains as a pool of 12 x 1-GPU + 6 x 2-GPU Slurm jobs (24 GPUs) on Arrhenius GH200 nodes that were only
+partly used: at 03:00 CET about 87 free GPUs sat on partly allocated nodes while whole-node jobs waited hours. The
+small jobs started within minutes (a 2-job smoke test within one second), train at ~19.6 samples/s per GPU, and
+0 contributions were dropped in the first 67 global versions.
+
+**Tested** (`tests/test_pool.py`, float64): with every live worker contributing once from the same base the update
+equals DiLoCo's Algorithm 1 (`torch.optim.SGD(nesterov=True)` on the mean pseudo-gradient); one arrival at a time it
+equals Liu et al.'s Algorithm 3; the exported weights equal the heavy-ball iterate (`SGD(nesterov=False)`); one
+worker with outer lr 1 and momentum 0 equals plain training step for step; a run every worker left resumes from the
+folder with samples, momentum and partial round intact; `progress_est` counts the live round (fixed or from
+heartbeats), never decreases and equals `progress` for a pool of one. Simulated with real processes: a job killed
+mid-round, a job killed while holding the run lock, a 100x slower job whose stale contributions are dropped while
+nobody waits, DDP inside a worker (both ranks use the same learning rates), the GPU cap. Simulated in one process: a
+crash between commit and inbox clean-up, a hung job that still heartbeats (a fake heartbeat file), and the
+launcher's cap / pending / budget stops (fake sbatch / squeue).
+
 ## How it works (short)
 
 1. **Fused projections + fused LoRA, no PEFT wrappers.** Projections that read the same input (q/k/v; gate/up; the four Gated DeltaNet input projections) run as one GEMM over a concatenated weight.
@@ -262,8 +376,8 @@ On a GH200 node (with fla, flash-attn, Liger and FA3 installed) the 31 LLM tests
 Agate tests (`tests/test_ideogram4.py`, `tests/test_fcdm.py`: float64 exactness of the DiT engine against Ideogram's
 transformer definition, recompute / split exactness, PEFT adapter round trip, the steer-once identity, bit-identical
 foreach EMA, end-to-end runs with exact resume; with Ideogram's package installed, the engine on a model built by its
-FP8 loader) run on CPU; on a Windows / x86 box with torch 2.5.1 and transformers 4.57.6 the whole suite gives
-39 passed, 5 skipped.
+FP8 loader) run on CPU, as do the 23 pool tests (`tests/test_pool.py`, with real worker processes); on a Windows /
+x86 box with torch 2.5.1 and transformers 4.57.6 the whole suite gives 62 passed, 5 skipped.
 
 ## Benchmark
 
