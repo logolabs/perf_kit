@@ -2,7 +2,8 @@
 
 Intentionally designed to maximise the use of GPUs that are only partly used: the free GPUs on partly allocated
 nodes and the short free windows of a busy cluster. Not for short runs (few outer rounds measured clearly worse
-than DDP) or when whole nodes start quickly; see README "Advanced mode" and WRITEUP section 10.
+than DDP) or when whole nodes start quickly, and validate the exported weights early against a short DDP run:
+untuned outer settings failed on a 104M conv VAE. See README "Advanced mode" and WRITEUP section 10.
 
 Many small jobs (1..N GPUs each, ordinary DDP inside) that start whenever GPUs are free work on ONE run; they join
 and leave at any time, and a big multi-node job can join the same run when it starts. Between jobs there is no

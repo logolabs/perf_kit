@@ -253,6 +253,10 @@ counts as two 1-GPU jobs. Contributions more than 4 rounds stale are dropped; no
   rounds. Plan for at least that many (a hypothesis from one run per point, not a measured threshold).
 - When whole nodes start quickly. Synchronous DDP is simpler and cost 7% fewer GPU-hours in the comparison (every
   pool job pays its own start-up and final evaluation, and 4-9% of trained samples were never applied).
+- Without an early check of the averaged model. Untuned outer settings (lr 0.7, momentum 0.9, H = 500) failed on a
+  104 M-parameter conv VAE (real use below) while every worker's own training loss looked fine. Validate the
+  exported global weights (`pool.load_global`) early against a short DDP run from the same start before committing
+  GPU-hours.
 - Very large models without tuning: every round writes the delta and reads the newest weights over the shared
   filesystem (0.7-0.9 s at 85 M parameters; larger models were not measured).
 
@@ -300,9 +304,10 @@ warm-up (`pool.local_steps`).
 
 **perf_kit's loop optimisations inside each job.** The pool adds nothing to the step itself: between outer syncs,
 `pool.sync` only counts, and every `done_check_every` (50) steps rank 0 checks the DONE file and reads the live
-jobs' heartbeats (one small JSON file per job), then broadcasts the result. The real run below used, together with the pool: `torch.compile` of the model, no host syncs in the step (losses
-summed on the GPU, read at log steps), data prepared ahead on a side CUDA stream, recompute of one branch to fit
-memory, `channels_last`, fused AdamW, and DDP gradients as bucket views inside each job.
+jobs' heartbeats (one small JSON file per job), then broadcasts the result. The real run below used, together
+with the pool: `torch.compile` of the model, no host syncs in the step (losses summed on the GPU, read at log steps),
+data prepared ahead on a side CUDA stream, recompute of one branch to fit memory, `channels_last`, fused AdamW, and
+DDP gradients as bucket views inside each job (its failure was in the averaged model, not in the loop).
 
 **Measured comparison** (Arrhenius GH200, byte-level GPT of 85 M parameters, UltraChat single-turn text, bits per
 byte on 2,048 fixed validation windows; DDP = one 4-GPU job; pool = four jobs of 1, 2, 1 and 2 GPUs started at
@@ -323,15 +328,26 @@ different times, the third hard-killed mid-round in every repeat; same total sam
 | pool 1+2+1+2, r3 (5713262-65) | 1.5766 | 1.7878 | 0.134 | 150 s | 28, 58, 28, 35 s |
 | pool 1+2+1+2, r5, outer momentum 0.5 (5715039-42) | 1.3975 | 1.3911 | 0.165 | 204 s | 54, 144, 54, 84 s |
 
-At 1.2 M samples no quality loss was measured (pool 1.296 / 1.363 / 1.299, n = 3, against DDP 1.333 / 1.335,
-n = 2; the pool's spread is much larger) at +7% GPU-hours; the short run lost clearly. Time from first eligibility
-to the final model: DDP 292 / 903 / 1,130 s, pool 423 / 316 / 332 / 178 s.
+On this language model, at 1.2 M samples no quality loss was measured (pool 1.296 / 1.363 / 1.299, n = 3, against DDP
+1.333 / 1.335, n = 2; the pool's spread is much larger) at +7% GPU-hours; the short run lost clearly. Time from first
+eligibility to the final model: DDP 292 / 903 / 1,130 s, pool 423 / 316 / 332 / 178 s.
 
-**Real use** (snapshot of 2026-11-25, run in progress, no quality claim yet). A 104 M-parameter image VAE at
-1024 px trains as a pool of 12 x 1-GPU + 6 x 2-GPU Slurm jobs (24 GPUs) on Arrhenius GH200 nodes that were only
-partly used: at 03:00 CET about 87 free GPUs sat on partly allocated nodes while whole-node jobs waited hours. The
-small jobs started within minutes (a 2-job smoke test within one second), train at ~19.6 samples/s per GPU, and
-0 contributions were dropped in the first 67 global versions.
+**Real use: a failure** (2026-11-25). A 104 M-parameter convolutional image VAE (GroupNorm) at 1024 px trained as a
+pool of 12 x 1-GPU + 6 x 2-GPU Slurm jobs (24 GPUs) on Arrhenius GH200 nodes that were only partly used, with
+untuned outer settings (outer lr 0.7, momentum 0.9, H = 500, asynchronous Delayed Nesterov, schedule by
+`progress`). Throughput and queue worked: at 03:00 CET about 87 free GPUs sat on partly allocated nodes while
+whole-node jobs waited hours; the small jobs started within minutes (a 2-job smoke test within one second), trained
+at ~19.6 samples/s per GPU, and 0 contributions were dropped in the first 67 global versions. Quality did not: the
+run was stopped as a failure at ~22% of its length (1.34 M samples, 145 global versions, 22.4 GPU-hours). On the
+exported global weights (`load_global`, the heavy-ball iterate) held-out glyphs had a worst-point median error of
+2.66 px (512 px scale) with 5.9% within 5 units, and logo layers 2.40 px, 8.2% and overlap 0.869; a 2-GPU synchronous
+DDP run from the same start reached ~1.0 px and 95-99% after only 48 k samples. The stored look-ahead point was worse
+still (3.8 px, 0%), and the in-run validation, taken right after a pull and so on the look-ahead point, read 5.9 px /
+0%. Meanwhile each worker's own training loss was low (reconstruction ~0.015, against 0.06-0.13 for the global
+weights): the averaged model was much worse than the models it averaged. The cause is not established. Candidates:
+outer momentum 0.9 with many asynchronous workers; H = 500 with a fresh inner AdamW in every job; the slow
+progress-based warm-up of the first rounds (the pitfall above); and GroupNorm conv nets may average worse than
+transformers.
 
 **Tested** (`tests/test_pool.py`, float64): with every live worker contributing once from the same base the update
 equals DiLoCo's Algorithm 1 (`torch.optim.SGD(nesterov=True)` on the mean pseudo-gradient); one arrival at a time it

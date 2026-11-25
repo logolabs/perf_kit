@@ -514,7 +514,8 @@ for perf_kit so all frameworks see the same step sets).
 can wait a long time while 1-2 GPU jobs start in seconds to minutes. Synchronous DDP needs all its GPUs at once.
 The pool is an opt-in, advanced mode, intentionally designed to maximise the use of GPUs that are only partly used:
 the free GPUs left on partly allocated nodes and the short free windows of a busy cluster. It is not a replacement
-for DDP when whole nodes start quickly, and it measured worse on short runs (below).
+for DDP when whole nodes start quickly; it measured worse on short runs, and with untuned outer settings it
+failed on a 104 M-parameter conv VAE (both below).
 
 **Method (published, adapted).** DiLoCo (Douillard et al. 2023, [arXiv 2311.08105](https://arxiv.org/abs/2311.08105)):
 each worker trains H inner steps (AdamW) from the global weights; the mean pseudo-gradient (global minus local) is
@@ -578,20 +579,21 @@ What this shows, and does not:
   1.363, 1.577), and momentum 0.9 remembers ~10 rounds, the whole of a short run. One run at momentum 0.5 (r5) got
   1.398, consistent with it, but its job mix differed (the 2-GPU job started 144 s late, so the 1-GPU job did more
   rounds alone). H, outer lr and momentum were not tuned.
-- **Cost: +7% GPU-hours** (0.306 vs 0.284 mean at 1.2 M): every job pays its own start-up (imports, data load, NCCL init)
-  and final evaluation, 16-64 s per job; the sync itself (publish, apply, pull of 85 M fp32 weights over Lustre,
-  0.7-0.9 s each) is ~4% of busy time at H = 500; 4-9% of trained samples are never applied (the killed job's partial round,
-  rounds in flight when the run finishes; r1 ran before the in-round DONE check and lost the most).
+- **Cost: +7% GPU-hours** (0.306 vs 0.284 mean at 1.2 M): every job pays its own start-up (imports, data load, NCCL
+  init) and final evaluation, 16-64 s per job; the sync itself (publish, apply, pull of 85 M fp32 weights over
+  Lustre, 0.7-0.9 s each) is ~4% of busy time at H = 500; 4-9% of trained samples are never applied (the killed job's
+  partial round, rounds in flight when the run finishes; r1 ran before the in-round DONE check and lost the most).
 - **A killed job keeps its share for up to `heartbeat_timeout` (180 s).** In every repeat the round size stayed
   192 k samples (all four jobs) until the end, because the killed job's heartbeat had not yet expired: the
   survivors' contributions were scaled by 160/192 for the rest of these short runs. What the runs show is that
   nothing waits for a dead job, not that it is evicted quickly (eviction itself is tested on CPU).
-- **Queue.** On 2026-11-24 the full node waited 41 s, 642 s and 1,002 s (the scheduler had estimated ~2.5 h for the last two);
-  the pool's jobs started 5-161 s after becoming eligible. Time from first eligibility to the final model: DDP 292 /
-  903 / 1,130 s, pool 423 / 316 / 332 / 178 s. The pool's own wall time is longer because it starts with one GPU.
-- **Not measured against DDP:** larger models (sync cost grows with size; the file I/O was not optimised), pools of
-  more than 6 GPUs (the real use below runs 24, without a DDP baseline), a multi-node job joining, runs of hours,
-  outer-lr tuning.
+- **Queue.** On 2026-11-24 the full node waited 41 s, 642 s and 1,002 s (the scheduler had estimated ~2.5 h for the
+  last two); the pool's jobs started 5-161 s after becoming eligible. Time from first eligibility to the final model:
+  DDP 292 / 903 / 1,130 s, pool 423 / 316 / 332 / 178 s. The pool's own wall time is longer because it starts with
+  one GPU.
+- **Not measured against DDP on this model:** larger models (sync cost grows with size; the file I/O was not
+  optimised), pools of more than 6 GPUs, a multi-node job joining, runs of hours, outer-lr tuning. The one larger
+  pool tried (24 GPUs, the real use below) failed against DDP.
 
 **Schedule pitfall (found in real use, fixed).** `Pool.progress` is the applied samples at the worker's last pull
 plus its own unapplied samples. Until a worker's first outer sync nothing of the other workers is applied, so a
@@ -605,23 +607,35 @@ live worker is as far into its round as this one, is never below `progress`, nev
 end-of-round value until the applied samples catch up), and equals `progress` for a pool of one; `done` still
 depends only on applied samples. A worker that joined without `step_samples` beats a round size of 0 until its
 first publish, so the others cannot count it during exactly the round this is for: pass `step_samples`. Tested on
-CPU, including that both ranks of a 2-rank job use the same learning rates. Each joining job's inner AdamW also starts with empty moments, so warm up by local steps as well
-(`Pool.local_steps`; `example_lm.py --local_warmup N`).
+CPU, including that both ranks of a 2-rank job use the same learning rates. Each joining job's inner AdamW also
+starts with empty moments, so warm up by local steps as well (`Pool.local_steps`; `example_lm.py --local_warmup N`).
 
-**Real use (snapshot of 2026-11-25, run in progress, no quality claim yet).** A 104 M-parameter image VAE at
-1024 px trains as a pool of 12 x 1-GPU + 6 x 2-GPU Slurm jobs (24 GPUs) on GH200 nodes that were only partly used:
-at 03:00 CET about 87 free GPUs sat on partly allocated nodes while whole-node jobs waited hours. The small jobs
-started within minutes (a 2-job smoke test within one second); they train at ~19.6 samples/s per GPU, and 0
-contributions were dropped in the first 67 global versions. Its trainer uses the pool together with perf_kit's loop
-optimisations: `torch.compile` of the encoder and decoder, no host syncs in the step, data rendered ahead on a side
-CUDA stream, recompute of one branch to fit memory, `channels_last`, fused AdamW and DDP gradients as bucket views
-inside each job. Its pool-side choices: the schedule follows pool progress, data seeds include the worker index
-(`Pool.index`), validation runs in whichever job wins `Pool.claim(f"val_{k}")`, and a final claim job exports the
-global weights (`Pool.load_global`). The pool adds nothing to the step: between outer syncs `Pool.sync` only counts,
-and every `done_check_every` steps rank 0 checks the DONE file and reads the live jobs' heartbeats (one small JSON
-file per job), then broadcasts the result.
+**Real use: a failure (2026-11-25).** A 104 M-parameter convolutional image VAE (GroupNorm) at 1024 px trained as a
+pool of 12 x 1-GPU + 6 x 2-GPU Slurm jobs (24 GPUs) on GH200 nodes that were only partly used, with untuned outer
+settings (outer lr 0.7, momentum 0.9, H = 500, asynchronous Delayed Nesterov, schedule by `progress`). Throughput and
+queue worked: at 03:00 CET about 87 free GPUs sat on partly allocated nodes while whole-node jobs waited hours; the
+small jobs started within minutes (a 2-job smoke test within one second), trained at ~19.6 samples/s per GPU, and 0
+contributions were dropped in the first 67 global versions. Quality did not: the run was stopped as a failure at ~22%
+of its length (1.34 M samples, 145 global versions, 22.4 GPU-hours). On the exported global weights (`load_global`,
+the heavy-ball iterate) held-out glyphs had a worst-point median error of 2.66 px (512 px scale) with 5.9% within 5
+units, and logo layers 2.40 px, 8.2% and overlap 0.869; a 2-GPU synchronous DDP run from the same start reached ~1.0
+px and 95-99% after only 48 k samples. The stored look-ahead point was worse still (3.8 px, 0%), and the in-run
+validation, taken right after a pull and so on the look-ahead point, read 5.9 px / 0%. Meanwhile each worker's own
+training loss was low (reconstruction ~0.015, against 0.06-0.13 for the global weights): the averaged model was much
+worse than the models it averaged. The cause is not established. Candidates: outer momentum 0.9 with many
+asynchronous workers; H = 500 with a fresh inner AdamW in every job; the slow progress-based warm-up of the first
+rounds (the pitfall above); and GroupNorm conv nets may average worse than transformers. Its trainer used the pool
+together with perf_kit's loop optimisations: `torch.compile` of the encoder and decoder, no host syncs in the step,
+data rendered ahead on a side CUDA stream, recompute of one branch to fit memory, `channels_last`, fused AdamW and
+DDP gradients as bucket views inside each job; data seeds included the worker index (`Pool.index`) and validation ran
+in whichever job won `Pool.claim(f"val_{k}")`. The pool adds nothing to the step: between outer syncs `Pool.sync`
+only counts, and every `done_check_every` steps rank 0 checks the DONE file and reads the live jobs' heartbeats (one
+small JSON file per job), then broadcasts the result. Lesson, now in the README: validate the exported global weights
+early against a short DDP run from the same start before committing GPU-hours; a worker's own training loss says
+nothing about the averaged model.
 
-Compute for this section (smoke tests, the hung first smoke, the repeats, the evaluation job): 2.29 GPU-hours (sacct).
+Compute for the comparison (smoke tests, the hung first smoke, the repeats, the evaluation job): 2.29 GPU-hours
+(sacct); the failed real-use run above: 22.4 GPU-hours.
 
 ## Acknowledgement
 
