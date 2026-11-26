@@ -35,6 +35,7 @@ perf-kit-train = "perf_kit.train:main"
 perf-kit-gate = "perf_kit.gate:main"
 perf-kit-ideogram4 = "perf_kit.dit.ideogram4.train:main"
 perf-kit-fcdm = "perf_kit.t2i.fcdm.train:main"
+perf-kit-pool-launch = "perf_kit.pool.launch:main"
 
 [tool.setuptools.packages.find]
 include = ["perf_kit*"]
