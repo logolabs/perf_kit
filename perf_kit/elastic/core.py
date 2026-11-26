@@ -239,9 +239,15 @@ class ElasticTCP:
                 raise
             self._failure(f"{type(e).__name__}: {str(e)[:300]}")
 
-    def step(self) -> bool:
+    def step(self, post_commit=None) -> bool:
         """Verify the gradient sync, commit the optimizer step, then act on join / leave / stop. False: the step
-        failed and was discarded (a regroup already happened)."""
+        failed and was discarded (a regroup already happened).
+
+        `post_commit()`: per-step state updates that must belong to THIS step (an EMA of the weights, a step
+        counter in `extra`). It runs right after the optimizer step and BEFORE any regroup, so a newcomer receives
+        the state with this step's update in it. Done after step() returns instead, the old members would apply
+        it to the step before the regroup and the newcomer would not (found on the font generator, 2026-11-26:
+        a desync of the EMA at every join, repaired only by the next checksum's re-broadcast)."""
         if self.should_stop():
             return False
         W, r = self.world, self.rank
@@ -285,6 +291,8 @@ class ElasticTCP:
         self.samples += G * self.micro_batch
         self.micro += G
         self._loss_sum, self._n_micro = None, 0
+        if post_commit is not None:
+            post_commit()
         now = time.time()
         wall = now - self._t_last_step if self._t_last_step else 0.0
         self._t_last_step = now

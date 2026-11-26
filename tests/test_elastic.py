@@ -291,3 +291,21 @@ def test_hold_outlasts_the_collective_timeout(tmp_path, data):
     kinds = [e["event"] for e in _events(run)]
     assert "recovery" not in kinds and "stall_exit" not in kinds and kinds.count("epoch") == 1, kinds
     assert all(r["finished"] for r, _, _ in res)
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_ema_updated_in_post_commit_survives_a_join(tmp_path, data, late):
+    """An EMA (extra module) updated in step(post_commit=...) stays identical on all ranks across a join; updated
+    after step() returns (the font generator's first version) the newcomer's EMA misses one step and the checksum
+    check catches it (desync event + re-broadcast)."""
+    total = 12 * 4 * 60
+    run = tmp_path / "run"
+    base = ["--total_samples", total, "--ema", 0.9, "--chk_every", 1, "--step_sleep", 0.1, *(["--ema_late"] if late
+                                                                                            else [])]
+    ps = [_start("elastic", run, data, base, "jA"), _start("elastic", run, data, [*base, "--start_delay", 6], "jB")]
+    res = [_result(p) for p in ps]
+    _check_all(res)
+    ev = _events(run)
+    assert max(e["world"] for e in ev if e["event"] == "epoch") == 2
+    n_desync = sum(e["event"] == "desync" for e in ev)
+    assert (n_desync >= 1) if late else (n_desync == 0), [e["event"] for e in ev]

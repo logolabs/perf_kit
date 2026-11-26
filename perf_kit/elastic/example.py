@@ -54,6 +54,15 @@ def run_elastic(a, device, train, val):
     from perf_kit.elastic import ElasticTCP
     model, opt = build(a, device)
     fwd = torch.compile(model) if a.compile else model
+    ema = None
+    if a.ema:                                               # an EMA of the weights, updated once per committed step
+        import copy
+        ema = copy.deepcopy(model).requires_grad_(False)
+
+    def ema_update():
+        with torch.no_grad():
+            for pe, pn in zip(ema.parameters(), model.parameters()):
+                pe.lerp_(pn, 1 - a.ema)
 
     def warmup():                                           # compile + first-step costs before announcing
         if not a.compile:
@@ -68,7 +77,8 @@ def run_elastic(a, device, train, val):
                     timeout_s=a.timeout_s, hb_s=a.hb_s, dead_s=a.dead_s, gather_s=a.gather_s,
                     found_wait_s=a.found_wait_s, regroup_min_s=a.regroup_min_s, check_every_s=a.check_every_s,
                     ckpt_every_s=a.ckpt_every_s, log_every=a.log_every, chk_every=a.chk_every,
-                    init_from=a.init_from or None, warmup=warmup, iface=a.iface, device=device)
+                    init_from=a.init_from or None, warmup=warmup, iface=a.iface, device=device,
+                    extra_modules={"ema": ema} if ema is not None else None)
     t_train0 = time.time()
     steps_here = 0
     while not el.should_stop():
@@ -88,7 +98,9 @@ def run_elastic(a, device, train, val):
                         os._exit(9)
                     el.backward(loss)
             set_lr(opt, lr_at(el.progress, a) * el.lr_scale)
-            if el.step():
+            if el.step(post_commit=ema_update if (ema is not None and not a.ema_late) else None):
+                if ema is not None and a.ema_late:          # the wrong place (test of the 2026-11-26 desync)
+                    ema_update()
                 steps_here += 1
             if a.hold_at_step and el.step_n == a.hold_at_step:
                 with el.hold("test"):                       # long rank-0 work (an evaluation), others wait
@@ -236,6 +248,8 @@ def main(argv=None):
     ap.add_argument("--leave_at_step", type=int, default=0)
     ap.add_argument("--hold_at_step", type=int, default=0, help="test hook: rank 0 sleeps --hold_s inside el.hold()")
     ap.add_argument("--hold_s", type=float, default=0.0)
+    ap.add_argument("--ema", type=float, default=0.0, help="> 0: keep an EMA of the weights (an extra module)")
+    ap.add_argument("--ema_late", action="store_true", help="test hook: update the EMA after step() returns")
     ap.add_argument("--step_sleep", type=float, default=0.0, help="test hook: sleep after each step (slow CPU run)")
     a = ap.parse_args(argv)
     if os.environ.get("ELASTIC_TRACE_AFTER"):              # debugging aid: dump all stacks after S seconds
