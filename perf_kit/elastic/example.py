@@ -104,7 +104,7 @@ def run_elastic(a, device, train, val):
     out = {"mode": "elastic", "mid": el.mid, "rank": el.rank, "epoch": el.epoch, "step": el.step_n,
            "samples": el.samples, "steps_here": steps_here, "finished": el._finished, "left": el._left,
            "gave_up": el._gave_up, "train_s": round(t_train, 2), "timing": el.timing}
-    if el._finished and el.rank == 0 and steps_here > 0:     # (a job that arrives after DONE trained nothing)
+    if el.final_rank0:                                      # (a job that arrives after DONE trained nothing)
         from perf_kit.elastic.state import fingerprint
         out["sha256"] = fingerprint({"model": model})
         out["val_bpb"] = evaluate(model, val, a.ctx, a.val_windows, device)

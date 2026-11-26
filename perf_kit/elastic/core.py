@@ -143,6 +143,7 @@ class ElasticTCP:
         self.roster_rec = None
         self.model = None                                   # this epoch's DDP wrapper
         self._finished = self._left = self._gave_up = False
+        self.final_rank0 = False            # True only on the rank 0 of the epoch that finished the run
         self._want_leave = False
         self._flags = {"join": False, "stop": False, "superseded": False}
         self._loss_sum, self._n_micro = None, 0
@@ -153,7 +154,8 @@ class ElasticTCP:
         self._last_ckpt = time.time()
         self._ckpt_thread = None
         self._hold_n = 0
-        self.timing = {"sync_s": 0.0, "steps": 0, "step_wall_s": 0.0, "regroups": 0, "failures": 0}
+        self.timing = {"sync_s": 0.0, "steps": 0, "step_wall_s": 0.0, "regroups": 0, "failures": 0, "chk_ok": 0,
+                       "chk_bad": 0}
         self._t_last_step = None
         self._log_acc = {"n": 0, "sync": 0.0, "wall": 0.0, "wn": 0}
         self.history = []                                   # rank 0: the metrics rows written
@@ -299,6 +301,7 @@ class ElasticTCP:
         if chk:
             ck = v[5 + 2 * W:5 + 3 * W]
             desync = max(ck) != min(ck)
+            self.timing["chk_bad" if desync else "chk_ok"] += 1
             if desync and r == 0:
                 self.log(f"[elastic] DESYNC at step {self.step_n}: parameter checksums differ {ck}; re-broadcasting")
                 self.mem.event({"event": "desync", "epoch": self.epoch, "step": self.step_n, "checksums": ck})
@@ -755,6 +758,7 @@ class ElasticTCP:
         self.mem.leave()
 
     def _finish(self, why: str):
+        self.final_rank0 = self.rank == 0
         if self.rank == 0:
             path = self._checkpoint(sync=True, hold=False)
             from ..pool.store import write_json
@@ -840,7 +844,8 @@ class ElasticTCP:
         row = {"t": round(time.time(), 3), "step": self.step_n, "samples": self.samples, "epoch": self.epoch,
                "world": self.world, "loss": self.last_loss, "loss_ranks": [round(x, 6) for x in losses],
                "ctrl_wait_ms": round(1e3 * a["sync"] / a["n"], 3), "step_s": round(a["wall"] / max(1, a.get("wn", 0)), 5),
-               "lr_scale": self.lr_scale, "global_batch": self.global_batch}
+               "lr_scale": self.lr_scale, "global_batch": self.global_batch,
+               "chk_ok": self.timing["chk_ok"], "chk_bad": self.timing["chk_bad"]}
         if chk_ok:
             row["chk_equal"] = True
         self.history.append(row)
