@@ -545,3 +545,45 @@ def test_progress_est_fixed_round_own_pace_and_solo(tmp_path):
         solo.sync(m, 4)
         assert solo.progress_est == pytest.approx(solo.progress)
     solo.close()
+
+
+# ------------------------------------------------------------------ pool2 fixes (2026-11-25)
+def _bare_pool(run, cfg_extra=None):
+    """A Pool object with only what _live_round needs (no join)."""
+    from perf_kit.pool import Pool
+    p = Pool.__new__(Pool)
+    p.store = Store(run)
+    p.cfg = {"heartbeat_timeout": 1e9, "stall_min_s": 300.0, **(cfg_extra or {})}
+    return p
+
+
+def test_first_round_worker_counts_in_round_size(tmp_path):
+    """A live worker in its first round (joined 400 s ago, never published: compile + data start-up) counts in the
+    round size for first_round_s; before pool2 it dropped out after stall_min_s (300 s) and the first arrivals of
+    the 2026-11-25 VAE run were weighted 1.0, 0.5, 0.2, ... A worker that joined without step_samples beats 0."""
+    now = time.time()
+    st = Store(tmp_path)
+    st.heartbeat("slow", {"gpus": 1, "joined": now - 400, "samples_per_round": 8000})
+    st.heartbeat("fresh", {"gpus": 1, "joined": now - 10, "samples_per_round": 8000})
+    st.heartbeat("nostep", {"gpus": 1, "joined": now - 400, "samples_per_round": 0})
+    st.heartbeat("hung", {"gpus": 1, "joined": now - 5000, "samples_per_round": 8000})          # > first_round_s
+    st.heartbeat("pub", {"gpus": 1, "joined": now - 2000, "samples_per_round": 8000, "last_publish": now - 200,
+                         "round_s": 300})
+    st.heartbeat("stalled", {"gpus": 1, "joined": now - 4000, "samples_per_round": 8000,
+                             "last_publish": now - 2000, "round_s": 300})
+    old = _bare_pool(tmp_path)                                       # a config written before pool2
+    assert old._live_round() == 8000 + 8000                          # fresh + pub: the old behaviour
+    new = _bare_pool(tmp_path, {"first_round_s": 3600.0})
+    assert new._live_round() == 8000 + 8000 + 8000                   # + slow; nostep adds 0, hung / stalled out
+
+
+def test_health_rule_fires_on_oscillation_not_on_noise():
+    """Median of the last 5 pulled/local ratios > 1.25: fires on the as-run N=24 tiny-VAE sequence (oscillating,
+    never 3 in a row above 1.5) and on the cluster run's proxy, silent on momentum-0 / synchronous / N=3."""
+    from perf_kit.pool.worker import is_unhealthy
+    asrun = [0.95, 1.0, 1.33, 1.14, 0.95, 1.37, 1.30, 0.97, 1.46, 1.51, 1.0, 1.46, 1.73, 1.16, 1.46]
+    fired = [i for i in range(1, len(asrun) + 1) if is_unhealthy(asrun[:i])]
+    assert fired and fired[0] == 7
+    assert is_unhealthy([8.3, 4.6, 3.6])
+    for ok in ([0.86] * 15, [0.92, 0.96, 0.9, 1.1, 0.95, 1.23, 1.05, 0.98], [1.0, 1.6, 1.0, 1.0, 1.0]):
+        assert not any(is_unhealthy(ok[:i]) for i in range(1, len(ok) + 1))

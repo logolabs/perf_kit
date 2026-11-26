@@ -30,6 +30,7 @@ workers cannot count it during its first round, which is exactly the round progr
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import threading
@@ -60,6 +61,29 @@ def _unwrap(model):
     return getattr(model, "_orig_mod", model)
 
 
+def weights_hash(tensors: dict) -> str:
+    """sha256 over the named tensors' values (sorted names, float32 bytes on the CPU): identical weights, same hash."""
+    h = hashlib.sha256()
+    for k in sorted(tensors):
+        t = tensors[k].detach().to("cpu", torch.float32).contiguous()
+        h.update(k.encode())
+        h.update(t.numpy().tobytes())
+    return h.hexdigest()
+
+
+def unhealthy_median(ratios, window: int = 5) -> float:
+    r = sorted(ratios[-window:])
+    if not r:
+        return 0.0
+    n = len(r)
+    return r[n // 2] if n % 2 else 0.5 * (r[n // 2 - 1] + r[n // 2])
+
+
+def is_unhealthy(ratios, warn: float = 1.25, window: int = 5, min_n: int = 3) -> bool:
+    """Health rule: the median pulled/local probe ratio of the last `window` syncs (at least `min_n`) > warn."""
+    return len(ratios) >= min_n and unhealthy_median(ratios, window) > warn
+
+
 def _dist():
     import torch.distributed as dist
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -80,11 +104,23 @@ class Pool:
                  seed: int = 0, keep_versions: int = 3, keep_every: int = 0, heartbeat_s: float = 30.0,
                  heartbeat_timeout: float = 180.0, stall_min_s: float = 300.0, lock_timeout: float = 600.0, state_dtype=torch.float32,
                  worker_id: str | None = None, delta_dtype=None, step_samples: int | None = None,
-                 done_check_every: int = 50, log=print):
+                 done_check_every: int = 50, log=print, first_round_s: float = 3600.0, probe=None,
+                 health_warn: float = 1.25):
         """Join (or create) the run in `run_dir`. Settings other than `gpus` / `worker_id` are fixed by whichever
         worker creates the run (config.json); later workers' values are ignored with a warning if different.
         `step_samples` (samples per optimizer step of this job), if given, lets the pool count this worker in the
-        round size from the moment it joins rather than from its first contribution."""
+        round size from the moment it joins rather than from its first contribution.
+
+        `first_round_s` (pool2 fix, 2026-11-25): a live worker that has not published yet counts in the round size
+        for this long after joining (before: only stall_min_s = 300 s, so on the VAE, whose first round took ~800 s
+        with torch.compile, the first contributions were weighted 1.0, 0.5, 0.2, ... instead of 1/12 each).
+
+        `probe(model) -> float` (pool2 health check; called on rank 0 only, must not use collectives): a loss on a
+        fixed small batch. At every sync it is measured on the local weights just before publishing and on the
+        pulled global weights; both and their ratio go to <run>/health/<worker>.jsonl and `self.health`. When the
+        median ratio of the last 5 syncs (at least 3) exceeds `health_warn` it is logged loudly and written to
+        events.jsonl once ("unhealthy"): the pooled weights are worse than what the workers train to (the 2026-11-25
+        failure: ratio ~5 on the cluster; it OSCILLATES, so a "k in a row" rule can miss it - sim_pool_vae.py)."""
         d = _dist()
         self.rank = d.get_rank() if d else 0
         self.world = d.get_world_size() if d else 1
@@ -111,12 +147,22 @@ class Pool:
         self.done = False
         self.changed_total = 0
         self.timing = {"publish_s": 0.0, "apply_s": 0.0, "pull_s": 0.0, "broadcast_s": 0.0}
+        self.probe = probe
+        self.health_warn = float(health_warn)
+        self.health = {}
+        self._ratios = []                       # pulled / local probe ratios of this worker's syncs
+        self._warned_unhealthy = False
+        self.pulled_hash = None                 # sha256 of the weights after the first pull (rank 0)
+        if outer_momentum > 0 and mode == "dn":
+            self.log("[pool] note: outer momentum > 0 with asynchronous workers diverged on the 2026-11-25 VAE "
+                     "(24 workers, each re-converging within a round); momentum 0 is the safe setting there. "
+                     "Watch the health ratio (probe=...).")
         want = dict(inner_steps=int(inner_steps), total_samples=int(total_samples), max_gpus=int(max_gpus),
                     outer=dict(lr=outer_lr, momentum=outer_momentum, mode=mode, max_staleness=max_staleness,
                                staleness_weight=staleness_weight),
                     round_samples=round_samples, seed=int(seed), keep_versions=int(keep_versions),
                     keep_every=int(keep_every), heartbeat_timeout=float(heartbeat_timeout),
-                    stall_min_s=float(stall_min_s))
+                    stall_min_s=float(stall_min_s), first_round_s=float(first_round_s))
         info = None
         if self.rank == 0:
             self.store = Store(run_dir, lock_timeout=lock_timeout)
@@ -264,7 +310,10 @@ class Pool:
     def flush(self, model) -> bool:
         """Publish / apply / pull now (every rank must call it)."""
         d = _dist()
+        local_loss = None
         if self.rank == 0:
+            if self.probe is not None:
+                local_loss = float(self.probe(model))
             self._publish(model)
             try:
                 self._apply(wait=10.0)
@@ -280,7 +329,31 @@ class Pool:
             d.barrier()
         self._pull(model)
         self._round += 1
+        if self.rank == 0 and self.probe is not None:
+            self._health(local_loss, float(self.probe(model)))
         return True
+
+    def _health(self, local_loss, pulled_loss):
+        """Pulled global weights vs this worker's own weights on the probe batch (rank 0)."""
+        ratio = pulled_loss / max(local_loss, 1e-12)
+        self.health = {"round": self._round, "version": self.version, "local": local_loss, "pulled": pulled_loss,
+                       "ratio": ratio}
+        hd = self.store.root / "health"
+        hd.mkdir(exist_ok=True)
+        with open(hd / f"{self.worker}.jsonl", "a") as f:
+            f.write(json.dumps({"t": round(time.time(), 3), **self.health}) + "\n")
+        self._ratios.append(ratio)
+        self.health["ratio_med5"] = unhealthy_median(self._ratios)
+        if is_unhealthy(self._ratios, self.health_warn) and not self._warned_unhealthy:
+            self._warned_unhealthy = True
+            self.log(f"[pool] UNHEALTHY: over this worker's last syncs the pulled global weights' probe loss is "
+                     f"{self.health['ratio_med5']:.2f}x its own (median): the outer step is not averaging well "
+                     f"(outer {asdict(self.ocfg)}). Check outer momentum / lr.")
+            try:
+                with self.store.lock(wait=30.0):
+                    self.store.event({"event": "unhealthy", "worker": self.worker, **self.health})
+            except LockBusy:
+                pass
 
     # ---------------------------------------------------------------- internals
     def _publish(self, model):
@@ -314,9 +387,15 @@ class Pool:
             if exclude is not None and w.get("worker") == exclude:
                 continue
             # a heartbeat proves the process lives, not that it trains: a worker counts in the round only while
-            # it publishes on time (3 of its own round times, at least stall_min_s, since its last publish / join)
-            last = w.get("last_publish") or w.get("joined", now)
-            if now - last <= max(self.cfg.get("stall_min_s", 300.0), 3.0 * w.get("round_s", 0.0)):
+            # it publishes on time (3 of its own round times, at least stall_min_s, since its last publish).
+            # pool2 fix: a worker still in its FIRST round (compile, data start-up) counts for first_round_s after
+            # joining; before, it dropped out after stall_min_s and the first arrivals were over-weighted.
+            last = w.get("last_publish")
+            if last is None:
+                ok = now - w.get("joined", now) <= self.cfg.get("first_round_s", self.cfg.get("stall_min_s", 300.0))
+            else:
+                ok = now - last <= max(self.cfg.get("stall_min_s", 300.0), 3.0 * w.get("round_s", 0.0))
+            if ok:
                 tot += w.get("samples_per_round", 0)
         return float(tot)
 
@@ -378,12 +457,30 @@ class Pool:
         if self.rank == 0:
             g = self.store.load(full=False)
             self._global = g
+            if self.pulled_hash is None:         # pool2 check, first pull: names match exactly, nothing unpooled
+                miss, extra = sorted(set(g.params) - set(named_p)), sorted(set(named_p) - set(g.params))
+                if miss or extra:
+                    raise RuntimeError(f"[pool] model and global weights differ in names: global-only {miss[:5]}, "
+                                       f"model-only {extra[:5]} (compile / DDP wrapper or a different model?)")
+                frozen = [_clean(n) for n, p in m.named_parameters() if not p.requires_grad]
+                other = [_clean(n) for n, b in m.named_buffers() if b is not None and not torch.is_floating_point(b)]
+                if frozen or other:
+                    self.log(f"[pool] note: not pooled (kept per worker): frozen params {frozen[:5]}, "
+                             f"non-float buffers {other[:5]}")
             with torch.no_grad():
                 for k, p in named_p.items():
                     p.copy_(g.params[k].to(p.dtype))
                 for k, b in named_b.items():
                     if k in g.buffers:
                         b.copy_(g.buffers[k].to(b.dtype))
+            if self.pulled_hash is None:         # the copy is exact: weights after the pull == the global version
+                mine = weights_hash({k: p for k, p in named_p.items()})
+                ref = weights_hash({k: g.params[k].to(p.dtype) for k, p in named_p.items()})
+                if mine != ref:
+                    raise RuntimeError("[pool] weights after the first pull differ from the global version")
+                self.pulled_hash = mine
+                self.store.event({"event": "first_pull", "worker": self.worker, "version": g.version,
+                                  "sha256": mine})
             meta = {"version": g.version, "rounds": g.rounds, "samples": g.samples, "done": self.store.done(),
                     "others": self._others_round()}
         self.timing["pull_s"] += time.time() - t0
@@ -443,4 +540,4 @@ class Pool:
         return {"worker": self.worker, "index": self.index, "gpus": self.gpus, "version": self.version,
                 "applied_samples": self.applied_samples, "progress": self.progress,
                 "progress_est": self.progress_est, "rounds_done": self._round, "contributions": self._seq,
-                "timing": dict(self.timing), "outer": asdict(self.ocfg)}
+                "timing": dict(self.timing), "outer": asdict(self.ocfg), "health": dict(self.health)}
