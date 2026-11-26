@@ -20,6 +20,8 @@ a LoRA engine for the **Ideogram 4** diffusion transformer ([`perf_kit/dit/ideog
 the optimised training loop of **Agate**, LogoLabs' FCDM text-to-image model ([`perf_kit/t2i/fcdm`](#agate-fcdm-text-to-image)).
 An advanced mode, [`perf_kit/pool`](#advanced-mode-growable-gpu-pool-perf_kitpool), trains one run on many small Slurm jobs
 that join and leave at any time: it is intentionally designed to maximise the use of GPUs on partly used nodes.
+A second one, [`perf_kit/elastic`](#advanced-mode-elastic-synchronous-ddp-over-tcp-perf_kitelastic), does the same with
+synchronous per-step DDP over TCP between the jobs, so the run keeps the math of one big DDP job.
 
 perf_kit is a small training engine (~2,600 lines of Python + Triton) that computes the same loss and the same LoRA
 gradients as transformers + PEFT (tested in float64 against them) while removing most of the work around the
@@ -349,6 +351,27 @@ outer momentum 0.9 with many asynchronous workers; H = 500 with a fresh inner Ad
 progress-based warm-up of the first rounds (the pitfall above); and GroupNorm conv nets may average worse than
 transformers.
 
+**Cause found (same day): the outer momentum.** In this pool every contribution arrives about one round late
+(median 0.96 rounds in the run's events), and each VAE worker re-converges within its round. Under those conditions
+Nesterov momentum 0.9 overshoots, and the global weights swing with growing amplitude while every worker repairs them
+locally: the workers' median reconstruction loss was ~0.012 before each sync, 0.03-0.12 in the 50 steps after the
+pull, and back to ~0.015 within 100 steps, for 10 rounds without improvement. Different inits, unpooled buffers,
+`_orig_mod.` / `module.` name mismatches and a bad load at evaluation were each ruled out and are now asserted at the
+first pull. The pool's own `outer.apply` on a quadratic model diverges from about 5 workers up at lr 0.7 /
+momentum 0.9 (4 workers sit at the edge, which is why the 4-job language-model comparison above matched DDP); with
+momentum 0 it converges at every worker count tested. On a tiny version of the real VAE (24 simulated workers, CPU)
+the global loss was 1.46x the workers' own and growing with 0.7 / 0.9, and 0.86x with momentum 0. A GPU proof with
+the fix (3 x 1-GPU jobs, lr 1.0, momentum 0, H = 100, 144 k samples, 512 px) reached 0.906 of held-out glyphs within
+5 units against 0.902 for a plain 1-GPU run of the same samples (3 workers would not have shown the old failure;
+the claim for ~24 workers rests on the simulations). **Use outer momentum 0 for more than ~3 asynchronous
+workers.** The default stays 0.9 so the comparison above reproduces, and the pool now logs a warning when momentum
+is above 0 in asynchronous mode. A health probe (`Pool(..., probe=fn)`, `fn(model) -> loss` on a fixed batch)
+writes the loss of the local and of the pulled weights at every sync to `<run>/health/<worker>.jsonl` and raises an
+alarm when the median ratio of the last 5 syncs exceeds `health_warn` (1.25): on a replay of the failed run it fires
+at the third sync. Two smaller defects were fixed with it: a worker still in its first round now counts in the round
+size (`first_round_s`; the first 12 contributions had counted as 2.67 rounds), and the first-pull name and hash
+checks above.
+
 **Tested** (`tests/test_pool.py`, float64): with every live worker contributing once from the same base the update
 equals DiLoCo's Algorithm 1 (`torch.optim.SGD(nesterov=True)` on the mean pseudo-gradient); one arrival at a time it
 equals Liu et al.'s Algorithm 3; the exported weights equal the heavy-ball iterate (`SGD(nesterov=False)`); one
@@ -359,6 +382,126 @@ mid-round, a job killed while holding the run lock, a 100x slower job whose stal
 nobody waits, DDP inside a worker (both ranks use the same learning rates), the GPU cap. Simulated in one process: a
 crash between commit and inbox clean-up, a hung job that still heartbeats (a fake heartbeat file), and the
 launcher's cap / pending / budget stops (fake sbatch / squeue).
+
+## Advanced mode: elastic synchronous DDP over TCP (`perf_kit/elastic`)
+
+**What it is for.** The same goal as the pool (use the 1-2 GPU slots a busy cluster offers within minutes), but with
+ordinary synchronous data parallelism: the gradient is all-reduced at every optimizer step, so one run made of many
+small Slurm jobs does the same math as one big DDP job. Jobs (1-4 GPUs each, one node each) join and leave at any
+time; a crashed or hung job is dropped without stopping the others.
+
+**Why TCP.** On an HPE Slingshot cluster every job gets its own VNI, so the fast libfabric / cxi path that NCCL uses
+inside a multi-node job cannot connect two separate jobs, and a site may require multi-node jobs to take whole nodes
+(on Arrhenius: at least (nodes - 1) x 4 + 1 GPUs). Plain IP over the same Slingshot interfaces does connect separate
+jobs, and NCCL's own socket transport runs over it. Measured between two separate 1-GPU jobs on different nodes
+(`hsn0`, NCCL defaults): 7.8 GB/s bus bandwidth, a 160 MB bf16 all-reduce in 21.6 ms (raw TCP 3.5 GB/s, gloo on CPU
+1.4 GB/s). Spreading NCCL over all four `hsn` interfaces with more sockets hung on the 160 MB collective, so the mode
+stays on one interface with NCCL's defaults.
+
+**How it works.** Membership lives in files of a shared run folder (heartbeats per process, one O_EXCL claim file per
+epoch so exactly one process leads it, a roster per epoch); the gradients go over NCCL, and every membership epoch is
+a fresh process group. One optimizer step: backward with DDP (bf16 compression hook, `no_sync` for accumulation),
+then a small control all-reduce with a timeout (alive count, join / leave / stop flags, loss and a parameter checksum
+per rank); only after it succeeds does `optimizer.step()` run, so a failed step is discarded and redone on the same
+data.
+- **Join:** at a step boundary the group is rebuilt and the source rank broadcasts model, extra modules (EMA),
+  optimizer state and counters; every rank checks a sha256 of the result.
+- **Leave:** Slurm's `--signal=B:TERM@120` (a trap touches a leave file) or a deadline from `squeue %e`; the job
+  finishes its step and the rest regroup. If every job leaves, rank 0 checkpoints and the next job resumes.
+- **Crash / hang:** the survivors catch the `DistBackendError` (a dead peer is seen in ~0.6 s, a hung one at the
+  timeout), abort the group in-process and regroup from the survivor with the highest committed step.
+- **Backstops:** a stall watchdog, a split-brain guard, and `hold()` for long rank-0 work (evaluations) during which
+  the other ranks wait on the TCPStore instead of inside a collective.
+
+This follows the in-memory recovery of Elastic Horovod and torchft rather than TorchElastic's restart-all, which is
+too slow for jobs that come and go every few minutes (details in
+[WRITEUP.md section 11](WRITEUP.md#11-advanced-mode-elastic-synchronous-ddp-over-tcp-perf_kitelastic)).
+`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, a common site default, kills the survivors on any NCCL error; the job script
+sets 2 (abort the communicator, keep the process) plus `TORCH_NCCL_BLOCKING_WAIT=1`.
+
+**Batch and lr.** With a fixed global batch (`global_micro=G`) the G micro-batches of a step are split over the ranks
+and the math is the same for every world size, join, leave or crash. With a fixed per-GPU batch (`accum=k`) the
+global batch is W x k x b, `el.lr_scale` is sqrt(global / `ref_batch`) (Adam; `lr_rule="linear"` for SGD), and
+schedules run on global samples (`el.progress`).
+
+**How to launch.**
+
+```python
+from perf_kit.elastic import ElasticTCP
+el = ElasticTCP(model, opt, "/shared/runs/my_run", total_samples=N, micro_batch=32, global_micro=12,
+                extra_modules={"ema": ema})               # joins (or founds) the run; a newcomer gets the live state
+while not el.should_stop():
+    with el.guard():                                      # a lost peer inside the step -> regroup, redo the step
+        mis = el.micro_indices()                          # this rank's share of the step's G micro-batches
+        for j, i in enumerate(mis):
+            with el.accumulate(last=j == len(mis) - 1):
+                el.backward(loss_fn(el.model, batch(seed, i)))
+        set_lr(opt, schedule(el.progress) * el.lr_scale)
+        if el.step(post_commit=update_ema) and eval_due(el.step_n):
+            with el.hold("eval"):                         # the other ranks wait without a collective timeout
+                if el.rank == 0:
+                    evaluate()
+el.close()
+```
+
+```bash
+export SITE_ENV=/path/site_env.sh REPO=$PWD EL_RUN=/shared/runs/my_run EL_SCRIPT=my_train.py EL_ARGS="..."
+python -m perf_kit.elastic.submit --run /shared/runs/my_run --n 8 --gpus 1 --time 06:00:00 \
+    --budget_gpu_hours 50 --max_gpus 12 --stagger 60 -- -A <account> -p <partition>
+```
+
+`bench/elastic/elastic_job.sbatch` is one job (one task per GPU; NCCL on sockets over `$EL_IFACE`, default `hsn0`;
+`NCCL_HOSTID` per job, so two jobs that land on one node also use sockets; no OFI plugin). A run can start from its
+own checkpoint, from a pool run's newest global weights (`init_from="pool:<dir>"`), or from a weights file.
+`perf_kit/elastic/example.py` is the worked example and test vehicle (the pool's byte-level GPT, elastic or
+same-math reference, with hooks that kill, hang or remove a rank at a given step).
+
+**Measured** (Arrhenius GH200, byte-level GPT of 85 M parameters, 2,000 steps x 384 windows = 768 k samples, fixed
+global batch of 12 micro-batches x 32, bits per byte on 2,048 validation windows; reference = the same script on one
+GPU accumulating the same 12 micro-batches):
+
+| run | val bpb | what happened |
+|---|---|---|
+| reference, 1 GPU (two repeats) | 1.3134 / 1.3142 | |
+| elastic, 4 separate 1-GPU jobs on 4 nodes, bf16 sync | **1.3081** | founded at world 3; one job hard-killed at step 600 (world 2); one left on Slurm's TERM at step 1,024 (world 1); one joined late at step 1,137 (world 2) |
+| elastic, 2 jobs, fixed world, fp32 sync | 1.3093 | both jobs landed on one node and talked over sockets |
+
+The first logged steps agree with the reference to 1e-4 in loss, so batch, loss scale and lr are the same math; later
+the curves drift apart chaotically, as the two references also do. Both elastic runs end ~0.005 bpb lower than both
+references (n = 2 per arm; not explained, and not the bf16 hook, since the fp32 run is lower too).
+
+| world | step (ms) | sync overhead per step (ms) | speed-up vs 1 GPU |
+|---|---|---|---|
+| 1 | 266 | 10 | 0.96 |
+| 2, bf16 | 154 | 26 | 1.66 |
+| 3, bf16 | 116 | 30 | 2.21 |
+| 2, fp32 | 175 | 38 | 1.57 |
+
+| membership change | regroup time |
+|---|---|
+| founding, world 3 (first NCCL init 8.2 s) | 9.9 s |
+| crash of one job | 18.5 s (17.5 s of it waiting for the dead job's heartbeat to expire) |
+| leave on TERM | 0.5 s |
+| late join | 1.4 s |
+
+The sync cost is ~26-30 ms per step at 85 M parameters; a model with longer steps pays relatively less. **Real use**
+(2026-11-26): an 80 M-parameter flow-matching font generator ran overnight as 16 x 1-GPU jobs, at most 8 at once,
+grown 2 -> 3 -> 4 -> 6 -> 8 with no desync, recovery or stall event and every parameter checksum equal, at 0.50-0.58
+s per step for 1,024 samples (~80-85% of 8 independent GPUs; evaluations idle the other ranks for ~10% of the time);
+its validation loss fell from 0.276 to 0.183 between 1.0 M and 2.6 M samples. A whole 4-GPU node was estimated to
+start ~14.5 h later.
+
+**When not to use it.** When whole nodes start quickly (plain DDP inside one job uses NVLink and the fast fabric);
+for models whose gradient is much larger than ~1 GB at this bandwidth. Not yet measured on GPUs: more than 8 ranks,
+2-4 GPU jobs joining, and a hang during a real training step.
+
+**Tested** (`tests/test_elastic.py`, CPU, gloo, real processes): a fixed world equals the same-math reference
+(loss curves equal to float noise, equal checksums); worlds 1, 2, 3, 2, 3, 2 through join, join, leave, crash
+(`os._exit`) and late join stay within 4e-7 in loss of the reference; a hung rank is timed out and the others
+finish on the reference curve; all jobs leave and a new job resumes from the checkpoint; exactly one winner of an
+epoch claim among 5 racing members; optimizer state transferred bit-identically; starting from a pool version; the
+per-GPU lr rule; mismatched settings refused; a hold longer than the collective timeout; EMA updated before a
+regroup (`post_commit`).
 
 ## How it works (short)
 
@@ -395,7 +538,8 @@ On a GH200 node (with fla, flash-attn, Liger and FA3 installed) the 31 LLM tests
 Agate tests (`tests/test_ideogram4.py`, `tests/test_fcdm.py`: float64 exactness of the DiT engine against Ideogram's
 transformer definition, recompute / split exactness, PEFT adapter round trip, the steer-once identity, bit-identical
 foreach EMA, end-to-end runs with exact resume; with Ideogram's package installed, the engine on a model built by its
-FP8 loader) run on CPU, as do the 23 pool tests (`tests/test_pool.py`, with real worker processes); on a Windows /
+FP8 loader) run on CPU, as do the pool and elastic tests (`tests/test_pool.py`, `tests/test_elastic.py`, with
+real worker processes; on Windows set `USE_LIBUV=0`); on a Windows /
 x86 box with torch 2.5.1 and transformers 4.57.6 the whole suite gives 62 passed, 5 skipped.
 
 ## Benchmark

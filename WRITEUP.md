@@ -637,6 +637,283 @@ nothing about the averaged model.
 Compute for the comparison (smoke tests, the hung first smoke, the repeats, the evaluation job): 2.29 GPU-hours
 (sacct); the failed real-use run above: 22.4 GPU-hours.
 
+### 10.1 Why the real-use run failed: outer momentum with stale contributions
+
+The night's own logs already show it. Median reconstruction loss over the 18 workers (`rec_avg`, mean of 50 steps)
+around each outer sync (one sync every 500 local steps):
+
+| round | workers | 50 steps before the sync | first 50 steps after the pull | 51-100 after | 201-250 after |
+|---|---|---|---|---|---|
+| 1 | 18 | 0.2818 | 0.2003 | 0.0850 | 0.0239 |
+| 2 | 18 | 0.0148 | 0.1229 | 0.0243 | 0.0151 |
+| 3 | 18 | 0.0128 | 0.0592 | 0.0169 | 0.0138 |
+| 4 | 18 | 0.0135 | 0.0487 | 0.0162 | 0.0135 |
+| 5 | 18 | 0.0127 | 0.0461 | 0.0157 | 0.0131 |
+| 6 | 14 | 0.0128 | 0.0702 | 0.0173 | 0.0135 |
+| 7 | 13 | 0.0128 | 0.0609 | 0.0150 | 0.0131 |
+| 8 | 13 | 0.0118 | 0.0306 | 0.0129 | 0.0119 |
+| 9 | 12 | 0.0111 | 0.0520 | 0.0128 | 0.0110 |
+| 10 | 12 | 0.0109 | 0.0577 | 0.0125 | 0.0101 |
+
+Every pull lands the workers on weights 3-10x worse than the ones they left, and each worker repairs them within
+~100 steps: training loss, so the stored global weights themselves are bad and the evaluation path is not to blame.
+
+| hypothesis | test | result |
+|---|---|---|
+| different initial weights per worker | 3 processes built from seeds 1000 / 1001 / 1002, then their first pull | ruled out: all pulled version 0 with the same sha256; now asserted |
+| buffers not pooled | the VAE's buffers | ruled out: none (GroupNorm only); the pool now logs any frozen parameter or non-float buffer it does not pool |
+| `_orig_mod.` / `module.` name mismatch, partial copy | `_pull` indexes every local parameter | ruled out; the pool now raises at the first pull if the name sets differ in either direction |
+| bad load at evaluation | `load_global` against a fresh model loaded from the same version | ruled out: identical loss (< 1e-6) |
+| outer settings | the quadratic and tiny-VAE grids below | **reproduced, and fixed by momentum 0** |
+
+**Quadratic model through the pool's own `outer.apply`** (no training; each worker travels a fraction h of the way to
+its local optimum in a round, contributions about one round stale as in the run; distance to the optimum after 60
+rounds, start 1; lr 0.7, momentum 0.9):
+
+| workers | h = 0.3 | h = 0.6 | h = 1.0 |
+|---|---|---|---|
+| 2 | 0.0005 | 7e-6 | 4e-6 |
+| 3 | 0.0005 | 9e-5 | 0.004 |
+| 4 | 0.0002 | 0.002 | 0.29 (oscillates) |
+| 5 | 0.0003 | 0.011 | 1.0 (diverges) |
+| 8 | 0.001 | 0.086 | 7.2 |
+| 18 | 0.0025 | 0.42 | 64 |
+| 24 | 0.0027 | 0.56 | 73 |
+
+With momentum 0, staleness s (in rounds) is what remains; distance after 60 rounds, 24 workers:
+
+| lr, h | s = 1 | s = 1.5 | s = 2 | s = 2.5 | s = 3 |
+|---|---|---|---|---|---|
+| lr 1.0, h 1 | 6e-6 | 0.47 | **34** | **240** | **710** |
+| lr 0.7, h 1 | 4e-10 | 2e-4 | 0.17 | **1.3** | **7.1** |
+| lr 0.5, h 1 | 4e-14 | 8e-7 | 3e-4 | 0.008 | 0.46 |
+
+**Tiny version of the real VAE on CPU** (the trainer's UVAE class and loss at widths 16 / 32 and 64 px, warm-started,
+24 simulated workers unless noted; pulled / local = loss of the pulled global weights over the workers' own):
+
+| arm | rounds | local | pulled (global) | pulled / local, 2nd half (median, max) |
+|---|---|---|---|---|
+| 24 workers, lr 0.7 / mom 0.9, async (as run) | 15 | 0.0366 | **0.0544** | **1.46, 1.71** |
+| 24 workers, lr 0.7 / mom 0, async | 15 | 0.0409 | 0.0353 | 0.86, 0.87 |
+| 24 workers, lr 1.0 / mom 0, async | 15 | 0.0402 | 0.0348 | 0.87, 0.87 |
+| 24 workers, lr 0.7 / mom 0.9, synchronous | 15 | 0.0362 | 0.0317 | 0.86, 0.88 |
+| 3 workers, lr 0.7 / mom 0.9, async | 60 | 0.0294 | 0.0314 | 1.11, 1.23 |
+| 3 workers, lr 1.0 / mom 0, async | 60 | 0.0354 | 0.0327 | 0.92, 0.96 |
+
+The 3-worker rows are why a 2-3 job smoke test cannot catch this. The tiny model reproduces the pattern (an
+oscillating global, healthy workers) but not the size (1.5x here, 3.6-8x on the cluster).
+
+**What changed in `perf_kit/pool`.**
+- A warning at start-up when outer momentum is above 0 in asynchronous mode (the default stays 0.9 so section 10's
+  comparison reproduces; use 0 for more than ~3 asynchronous workers, lr 0.7 tolerates contributions up to ~2 rounds
+  stale, lr 1.0 only ~1.5).
+- Health probe: `Pool(..., probe=fn)` with `fn(model) -> float` on a fixed batch; at every sync the loss of the local
+  and of the pulled weights and their ratio go to `<run>/health/<worker>.jsonl`, and when the median ratio of the
+  last 5 syncs (at least 3) exceeds `health_warn` (1.25) it is logged and written to `events.jsonl` once. A
+  "3 in a row" rule missed the oscillating case, hence the window. On replay it fires at round 7 of the as-run
+  tiny-VAE arm and at the third sync of the night's run, and stays silent on every healthy arm.
+- `first_round_s`: a live worker that has not published yet counts in the round size (the first round took ~800 s
+  against a 300 s publish window, so its first 12 contributions had counted as 2.67 rounds instead of 1).
+- First-pull checks: the same parameter names on both sides and the hash of the pulled version.
+
+CPU integration test of the trainer's pool path (3 processes from different seeds, 40 local steps per round, 12 k
+samples): with momentum 0 the probe ratio is 0.97 median (1.00 max at lr 0.7) and no alarm; with the as-run 0.7 /
+0.9 it is 1.16-1.17 median and the alarm fires.
+
+**GPU proof** (Arrhenius GH200, VAE at 512 px warm-started from the same checkpoint, 144 k samples each):
+
+| arm | jobs | held-out glyphs within 5 u | worst-point median (px, 512 scale) | pulled / local at the last sync | wall |
+|---|---|---|---|---|---|
+| pool: 3 x 1-GPU jobs, lr 1.0, momentum 0, H = 100, health probe | 3 jobs joined within 0.1 s | **0.906** | 0.591 | 0.97-0.98 | ~30 min |
+| plain: one 1-GPU job, batch 96 | 1 | 0.902 | 0.592 | - | 67 min |
+
+GPU-hours: 2.6 (sacct). The proof has 3 workers, which would not have shown the old failure; the claim for ~24
+workers rests on the simulations above.
+
+## 11. Advanced mode: elastic synchronous DDP over TCP (`perf_kit/elastic`)
+
+The pool keeps jobs loosely coupled and pays for it with drift between syncs and with outer-optimizer settings that
+must be right. If the jobs can reach each other fast enough to all-reduce every step, the run can instead keep the
+exact math of one big DDP job while still being made of small jobs that start within minutes.
+
+### 11.1 The network between separate jobs
+
+Arrhenius uses HPE Slingshot (`SwitchType=switch/hpe_slingshot`, libfabric `cxi`, aws-ofi-nccl 1.19.2). Inside one
+job, NCCL runs over cxi through the OFI plugin. Between jobs:
+
+| test (2026-11-25) | result |
+|---|---|
+| one job, 4 x 1 GPU on 4 nodes (`--nodes=4 --gpus-per-node=1`) | refused at submission: "You need to allocate at least (nodes-1)*4+1 GPUs" (site rule: multi-node jobs take whole nodes) |
+| one job, `--ntasks=4 --gpus=4` without a node count | accepted by the filter, but would only get past the rule by not stating its nodes: cancelled before it started |
+| fast path between separate jobs | Slurm gives each job its own VNI (`SwitchParameters ... job_vni=user`); not attempted |
+| plain IP over `hsn0` between two separate 1-GPU jobs on different nodes | works |
+
+Two separate 1-GPU jobs on different nodes, rendezvous through a file on the shared filesystem:
+
+| measurement | time | bandwidth |
+|---|---|---|
+| raw TCP, one stream, 1 GiB | - | 2.9-3.5 GB/s |
+| gloo all-reduce on CPU, 160 MB | 107-124 ms | 1.4-1.6 GB/s |
+| NCCL socket transport, GPU, 16 MB bf16 | 2.5 ms | 6.6 GB/s |
+| NCCL socket transport, GPU, 160 MB bf16 | **21.6 ms** | **7.8 GB/s** |
+| NCCL socket transport, GPU, 512 MB bf16 | 72.5 ms | 7.4 GB/s |
+| all four `hsn` interfaces, `NCCL_NSOCKS_PERTHREAD=4`, `NCCL_SOCKET_NTHREADS=4` | hung on the 160 MB collective until the job's time limit | - |
+
+### 11.2 Literature and what was adapted (from memory unless marked)
+
+| idea | source | used here as |
+|---|---|---|
+| membership change = restart every worker from a checkpoint | TorchElastic / torchrun rendezvous (PyTorch docs) | rejected as too slow for jobs that come and go every few minutes; kept: a rendezvous through a shared store and a checkpoint for a full restart |
+| in-memory state, commit / restore at step boundaries | Elastic Horovod (Horovod 0.20 docs, 2020) | a step is committed only after the gradient sync is verified; membership changes happen at step boundaries |
+| per-step quorum, a healthy peer sends its live state to the newcomer, abortable process groups | torchft (pytorch/torchft, 2024-25) | the epoch's source rank broadcasts model, optimizer and counters; the group is aborted and rebuilt in-process |
+| gradient buckets all-reduced during backward, `no_sync` for accumulation | Li et al., VLDB 2020 (PyTorch DDP) | plain DDP inside an epoch, rebuilt per epoch |
+| bf16 gradient compression | `ddp_comm_hooks.default_hooks.bf16_compress_hook` (checked in torch 2.13) | on by default on the GPU (NCCL only) |
+| linear / square-root lr scaling | Goyal et al. 2017; Malladi et al., NeurIPS 2022 | `lr_rule="linear"` / `"sqrt"` (default) |
+| a fixed global batch while the GPU count changes | Pollux (Qiao et al., OSDI 2021) | `global_micro=G` |
+| `TORCH_NCCL_ASYNC_ERROR_HANDLING` modes, `TORCH_NCCL_BLOCKING_WAIT`, `_abort_process_group`, DDP `init_sync` | read in torch 2.13's sources | verified |
+
+### 11.3 Design
+
+| file in the run folder | what |
+|---|---|
+| `members/<job>-<local rank>-<pid>.json` | IP on the interface, job id, job size, state (joining / active / recovering), epoch, committed step, heartbeat every 5 s |
+| `epochs/eNNNNNN.claim` | O_EXCL: whoever creates it leads that epoch (exactly one winner, also when every survivor races after a crash) |
+| `epochs/eNNNNNN.json` | the roster: members in rank order, rank 0's IP and port (the epoch's TCPStore), the source rank, the reason |
+| `leave/<job id>`, `STOP`, `DONE` | a job's TERM trap touches its leave file; STOP ends the run; DONE is written by the last rank 0 |
+| `ckpt/step_*.pt`, `metrics/elastic.jsonl`, `events.jsonl` | resume checkpoint, per-step health, one line per epoch / failure / join / leave / checkpoint |
+
+One optimizer step:
+1. Backward on this rank's micro-batches; DDP all-reduces the buckets (bf16 hook), `no_sync` on every micro-batch but
+   the last.
+2. A small control all-reduce, waited with the timeout: alive count, join pending, stop, superseded; one agreed value
+   from rank 0 (`agree()`, e.g. the time fraction of a deadline schedule); each rank's loss and leave flag; a parameter
+   checksum per rank every 50 steps. NCCL runs collectives in order, so a correct alive count proves that the gradient
+   sync finished on every rank.
+3. Only then `optimizer.step()`. If anything failed before this point, weights and optimizer are untouched: the step is
+   discarded and redone in the next epoch on the same micro-batch indices.
+4. Join, leave, stop and desync are read from the same control vector, so every rank takes the same branch.
+
+Membership changes:
+- **Join:** a job announces itself only after its own set-up. Rank 0's watcher thread sees it, and at the next step
+  boundary the leader writes epoch n+1 (survivors first, then newcomers grouped by job, so NVLink neighbours are
+  adjacent); everyone destroys the old group and initialises the new one; the source rank broadcasts the counters and
+  the extra dict, then all tensors (model, extra modules such as the EMA, optimizer state) in flat per-dtype buffers;
+  every rank checks a sha256 of parameters and buffers against the source's; DDP is rebuilt with `init_sync=False`.
+- **Leave:** Slurm's `--signal=B:TERM@120` reaches the batch shell, whose trap touches the leave file; a second,
+  signal-free trigger is `ELASTIC_LEAVE_AT` = the job's end time from `squeue %e` minus a margin. The job finishes its
+  step and the rest regroup. If every rank leaves, rank 0 checkpoints first and the next job resumes from it.
+- **Crash / hang:** the step's collective raises (under 1 s for a dead peer, at the timeout for a hung one). The
+  survivors abort the group and check in as recovering with their committed step; the first to claim the next epoch
+  waits until every old member has checked in or is dead (heartbeat older than 20 s); everyone receives the state of
+  the survivor with the highest step (survivors can be one step apart, so the whole state goes to everyone). A hung
+  process that wakes later finds it is not in the roster and comes back as a newcomer.
+- **Backstops:** a stall watchdog (a rank with no committed step for 3 timeouts plus the gather time, outside a hold,
+  exits with code 75; the gloo case, where a DDP all-reduce with a vanished peer never returns, and a deadlocked data
+  loader); a split-brain guard (a group that finds a newer roster without itself stops and rejoins); `hold()` for long
+  rank-0 work, during which the other ranks wait on the TCPStore instead of in a collective.
+- **Trap:** a site default of `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` tears the process down on any NCCL error, which kills
+  the survivors; the job script sets 2 (abort the communicator, keep the process) and `TORCH_NCCL_BLOCKING_WAIT=1`.
+
+### 11.4 GPU probe: does NCCL survive a lost peer in-process?
+
+3 separate 1-GPU jobs on 3 nodes, 6.8 GPU-minutes:
+
+| measurement | value |
+|---|---|
+| NCCL init, 3 jobs, first epoch | 1.04 s |
+| planned regroup (destroy + rendezvous + init), 3 times | 0.86-1.80 s |
+| small all-reduce (16 floats), world 3 | 1.23 ms |
+| 160 MB bf16 all-reduce, world 3 | 42 ms |
+| 1 GB fp32 broadcast | 123 ms (8.1 GB/s) |
+| peer killed (`os._exit`) mid all-reduce: detected | 0.58 s, `DistBackendError ... Connection closed by remote peer` |
+| then abort + regroup with world 2 | 1.25 s |
+| peer hung 70 s: the waiting rank | timeout at 45.5 s, then abort; regroup when the sleeper woke |
+
+### 11.5 GPU proof against a single-GPU run at equal samples
+
+Byte-level GPT (12 layers, d 768, 85 M parameters, context 256) on UltraChat single-turn text; AdamW lr 1e-3, 5%
+warm-up, cosine to 0.1; 2,000 steps x 384 windows = 768 k samples; fixed global batch of 12 micro-batches x 32; bits
+per byte on 2,048 validation windows. Reference: the same script (`--mode ref`) on one GPU accumulating the same 12
+micro-batches.
+
+Run p1: A, B and C started together on 3 nodes; C hard-died in its 600th step; B had a 6 min limit, so Slurm's TERM
+came at T-120 s; D had an earliest start 150 s later.
+
+| epoch | world | what happened | regroup (s) | NCCL init (s) | state transfer (s) | at step |
+|---|---|---|---|---|---|---|
+| 0 | 3 | founded (A, B, C on 3 nodes) | 9.9 | 8.2 | 0.08 | 0 |
+| 1 | 2 | C died: recovery (17.5 s waiting for C's heartbeat to expire) | 18.5 | 0.67 | 0.05 | 600 |
+| 2 | 1 | B left on Slurm's TERM | 0.51 | 0.03 | 0.01 | 1,024 |
+| 3 | 2 | D joined (a fourth node) | 1.40 | 0.64 | 0.05 | 1,137 |
+
+| run | final val bpb | train loss difference to ref 1, steps 1-200 / 201-600 / 601-1200 / 1201-2000 |
+|---|---|---|
+| ref 1 (1 GPU) | 1.3134 | - |
+| ref 2 (1 GPU, repeat) | 1.3142 | -0.0038 / -0.0029 / -0.0005 / -0.0005 |
+| elastic p1 (3 -> 2 -> 1 -> 2, bf16 sync) | **1.3081** | -0.0125 / -0.0131 / -0.0025 / -0.0018 |
+| elastic p2 (2 jobs, fixed world, fp32 sync, both on one node) | 1.3093 | -0.0087 / -0.0081 / -0.0022 / -0.0026 |
+
+- **Same math:** the first logged steps (10, 20, 30) agree with the reference to 1e-4 in loss; a wrong loss scale, lr
+  or batch would show there at once. Afterwards the trajectories drift apart chaotically, as the two references also
+  do (the reference itself is not bit-reproducible on the GPU).
+- **Not explained:** both elastic runs end ~0.005 bpb lower than both references (0.4%, against spreads of 0.0008
+  between the references and 0.0012 between the elastic runs). With n = 2 per arm this cannot be told from luck; no
+  code difference that would favour elastic is known, and it is not the bf16 hook (the fp32 run is lower too).
+- **Same node:** in p2 both jobs landed on one node and talked over sockets, because `NCCL_HOSTID` differs per job.
+
+Speed (median per step; the reference takes 21.3 ms per micro-batch):
+
+| world | step (ms) | compute share, 12 / W micro-batches (ms) | sync overhead per step (ms) | control wait (ms) | speed-up vs 1 GPU |
+|---|---|---|---|---|---|
+| 1 | 266 | 256 | 10 | 0.15 | 0.96 |
+| 2, bf16 sync | 154 | 128 | 26 | 1.3 | 1.66 |
+| 3, bf16 sync | 116 | 85 | 30 | 1.0 | 2.21 |
+| 2, fp32 sync (same node) | 175 | 137 | 38 | 0.5 | 1.57 |
+
+With an 85 M model synced every 4-6 micro-batches, TCP between jobs costs 26-30 ms per step, about 20-26% of the
+step at 2-3 GPUs; the bf16 hook saves about a third against fp32. A model with longer steps pays relatively less.
+
+### 11.6 Real use: an overnight font generator (2026-11-26)
+
+An 80 M-parameter flow-matching generator over the latents of a silhouette VAE, with a style-encoder branch, trained
+as a job array of 16 x 1-GPU jobs of 5:45 h, at most 8 at once, staggered leave times, a run deadline 11 h after
+creation. Per-GPU batch 128, lr 2e-4 x sqrt(128 W / 512), cosine over samples or time to the deadline (rank 0's clock
+through `agree()`), EMA updated per committed step through `post_commit` and transferred to newcomers, evaluations
+inside `hold()`. A whole 4-GPU node was estimated to start ~14.5 h later; the 1-GPU jobs started within minutes.
+
+| item | value |
+|---|---|
+| world | 2 -> 3 -> 4 -> 6 -> 8 as jobs started |
+| desync / recovery / stall events | 0 / 0 / 0 |
+| parameter checksums (model + EMA) | all equal (37 checks, 0 different, at step 3,700) |
+| step time at world 8 (1,024 samples) | 0.49-0.58 s, about 80-85% of 8 independent GPUs |
+| per-rank train loss at step 3,700 | 0.12-0.16 (different data, same weights) |
+| validation loss, conditioned on the style vector | 0.2730 at 1.02 M samples, 0.1774 at 2.56 M |
+| evaluation cost | ~300 s with sample sheets, the other ranks idle (~10% of the time) |
+
+Two bugs were found by the first launch and fixed before the run above (15 min, 1.9 GPU-hours): the EMA was updated
+after `step()`, so a newcomer missed one update (now `step(post_commit=...)`, with a test); and every rank refreshed
+its latent pool on its own counter, so almost every synchronous step waited for one rank's refresh (0.90 s per step
+at world 8; now on the global step, every 4 steps).
+
+### 11.7 Tests and limits
+
+`tests/test_elastic.py` (CPU, gloo, real local processes): micro-batch split and lr rule for W = 1..12; one winner
+among 5 members racing for an epoch claim; optimizer state transferred bit-identically into a fresh AdamW; a fixed
+world of 3 equal to the 1-process reference (loss curves equal to float noise, equal checksums, final validation
+within 5e-3); worlds 1, 2, 3, 2, 3, 2 through join, join, leave, crash (`os._exit`) and late join with a maximum loss
+difference of 4e-7 against the reference; a rank hung for 35 s with an 8 s timeout (the other regroups alone and
+finishes on the reference curve; the hung one is ended by the stall watchdog); every job leaves at step 20 and a third
+job resumes from the checkpoint on the reference curve; starting from a pool version (equal sha256); the per-GPU lr
+rule; a job with a different global batch refused; a hold longer than the collective timeout; EMA updated in
+`post_commit` before a regroup.
+
+Not yet measured on GPUs: more than 8 ranks, 2-4 GPU jobs joining, a hang inside a real training step, tuned NCCL
+socket settings. Crash recovery takes ~20 s, mostly waiting for the dead job's heartbeat to expire.
+
+Compute: probe 0.11, proof p1 0.46 and p2 ~0.4 GPU-hours; the transport tests of 11.1 0.53 GPU-hours (0.42 of it the
+hung tuned run); generator smoke tests 0.98 and the cancelled first launch 1.90 GPU-hours (sacct).
+
 ## Acknowledgement
 
 Compute: EuroHPC AI Factory allocation EHPC-AIF-2026PG01-907 on Arrhenius (NAISS, Sweden). The whole benchmark,
